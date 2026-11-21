@@ -1,6 +1,10 @@
 import { createBrowserRouter, Navigate } from "react-router-dom";
 
 import AppLayout from "../layouts/AppLayout";
+import ChartOfAccountsPage from "../modules/accounting/ChartOfAccountsPage";
+import FinancialReportsPage from "../modules/accounting/FinancialReportsPage";
+import JournalEntriesPage from "../modules/accounting/JournalEntriesPage";
+import ReceivablesPayablesPage from "../modules/accounting/ReceivablesPayablesPage";
 import InventoryPage from "../modules/inventory/InventoryPage";
 import ProductList from "../modules/inventory/ProductList";
 import WarehouseList from "../modules/inventory/WarehouseList";
@@ -116,8 +120,34 @@ export const router = createBrowserRouter([
             element: <RequireModule module="accounting" />,
             children: [
               {
-                path: "accounting",
-                element: <ModulePlaceholder module="accounting" />,
+                element: (
+                  <RequireRole
+                    roles={["accounting", "administrator"]}
+                    module="accounting"
+                  />
+                ),
+                children: [
+                  {
+                    path: "accounting",
+                    element: <Navigate to="/accounting/accounts" replace />,
+                  },
+                  {
+                    path: "accounting/accounts",
+                    element: <ChartOfAccountsPage />,
+                  },
+                  {
+                    path: "accounting/journal",
+                    element: <JournalEntriesPage />,
+                  },
+                  {
+                    path: "accounting/receivables",
+                    element: <ReceivablesPayablesPage />,
+                  },
+                  {
+                    path: "accounting/reports",
+                    element: <FinancialReportsPage />,
+                  },
+                ],
               },
             ],
           },

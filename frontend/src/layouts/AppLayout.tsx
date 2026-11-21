@@ -3,6 +3,7 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { initials, ROLE_LABELS } from "../modules/users/constants";
 import {
   accessibleModules,
+  ACCOUNTING_LINKS,
   INVENTORY_LINKS,
   PURCHASING_LINKS,
   SALES_LINKS,
@@ -41,12 +42,14 @@ export default function AppLayout() {
   const inventory = modules.find((module) => module.key === "inventory");
   const sales = modules.find((module) => module.key === "sales");
   const purchasing = modules.find((module) => module.key === "purchasing");
+  const accounting = modules.find((module) => module.key === "accounting");
   const users = modules.find((module) => module.key === "users");
   const otherModules = modules.filter(
     (module) =>
       module.key !== "inventory" &&
       module.key !== "sales" &&
       module.key !== "purchasing" &&
+      module.key !== "accounting" &&
       module.key !== "users",
   );
   const isInventoryReadOnly =
@@ -62,6 +65,11 @@ export default function AppLayout() {
     purchasing !== undefined &&
     user !== null &&
     (user.role.name === "administrator" || user.role.name === "purchasing");
+  // Igual que ventas y compras, las rutas exigen además el rol `accounting`.
+  const canOpenAccounting =
+    accounting !== undefined &&
+    user !== null &&
+    (user.role.name === "administrator" || user.role.name === "accounting");
 
   const mobileLinks = [
     ...(inventory === undefined
@@ -72,6 +80,9 @@ export default function AppLayout() {
       : []),
     ...(canOpenPurchasing
       ? PURCHASING_LINKS.map((link) => ({ to: link.to, label: link.label }))
+      : []),
+    ...(canOpenAccounting
+      ? ACCOUNTING_LINKS.map((link) => ({ to: link.to, label: link.label }))
       : []),
     ...otherModules.map((module) => ({
       to: module.path,
@@ -156,6 +167,27 @@ export default function AppLayout() {
               <>
                 <SectionLabel>{purchasing.label}</SectionLabel>
                 {PURCHASING_LINKS.map((item) => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end
+                    className={({ isActive }) => navItemClass(isActive)}
+                  >
+                    <span className="block text-sm font-semibold lg:text-[0.8125rem]">
+                      {item.label}
+                    </span>
+                    <span className="hidden text-xs text-concrete-400 lg:block">
+                      {item.description}
+                    </span>
+                  </NavLink>
+                ))}
+              </>
+            ) : null}
+
+            {canOpenAccounting && accounting !== undefined ? (
+              <>
+                <SectionLabel>{accounting.label}</SectionLabel>
+                {ACCOUNTING_LINKS.map((item) => (
                   <NavLink
                     key={item.to}
                     to={item.to}

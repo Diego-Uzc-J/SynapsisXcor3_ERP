@@ -48,9 +48,9 @@ export const MODULES: readonly ModuleDefinition[] = [
   {
     key: "accounting",
     label: "Contabilidad",
-    description: "Facturación y libros contables",
+    description: "PUC, diario, cartera y reportes",
     path: "/accounting",
-    implemented: false,
+    implemented: true,
   },
   {
     key: "hr",
@@ -131,6 +131,29 @@ export const PURCHASING_LINKS = [
     to: "/purchasing/bills",
     label: "Facturas",
     description: "Cuentas por pagar y abonos",
+  },
+] as const;
+
+export const ACCOUNTING_LINKS = [
+  {
+    to: "/accounting/accounts",
+    label: "Plan de cuentas",
+    description: "PUC jerárquico",
+  },
+  {
+    to: "/accounting/journal",
+    label: "Libro diario",
+    description: "Asientos de partida doble",
+  },
+  {
+    to: "/accounting/receivables",
+    label: "CxC / CxP",
+    description: "Cobros, pagos y saldos",
+  },
+  {
+    to: "/accounting/reports",
+    label: "Reportes",
+    description: "Estados financieros",
   },
 ] as const;
 

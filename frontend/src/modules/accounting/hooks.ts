@@ -85,10 +85,11 @@ function invalidateLedgers(queryClient: QueryClient): void {
 // --------------------------------------------------------------------------- //
 
 /** Lista el plan de cuentas con filtros por código, nombre, tipo y estado. */
-export function useAccounts(filters: AccountFilters = {}) {
+export function useAccounts(filters: AccountFilters = {}, enabled = true) {
   return useQuery({
     queryKey: accountingKeys.accounts.list(filters),
     queryFn: () => listAccounts(filters),
+    enabled,
   });
 }
 
@@ -105,10 +106,14 @@ export function useAccount(accountId: number, enabled = true) {
 // --------------------------------------------------------------------------- //
 
 /** Lista asientos por código, estado y rango de fechas. */
-export function useJournalEntries(filters: JournalEntryFilters = {}) {
+export function useJournalEntries(
+  filters: JournalEntryFilters = {},
+  enabled = true,
+) {
   return useQuery({
     queryKey: accountingKeys.journalEntries.list(filters),
     queryFn: () => listJournalEntries(filters),
+    enabled,
   });
 }
 
@@ -124,10 +129,11 @@ export function useJournalEntry(entryId: number, enabled = true) {
 // Consultas — cartera y pagos
 // --------------------------------------------------------------------------- //
 
-export function useReceivables(filters: ReceivableFilters = {}) {
+export function useReceivables(filters: ReceivableFilters = {}, enabled = true) {
   return useQuery({
     queryKey: accountingKeys.receivables.list(filters),
     queryFn: () => listReceivables(filters),
+    enabled,
   });
 }
 
@@ -139,10 +145,11 @@ export function useReceivable(receivableId: number, enabled = true) {
   });
 }
 
-export function usePayables(filters: PayableFilters = {}) {
+export function usePayables(filters: PayableFilters = {}, enabled = true) {
   return useQuery({
     queryKey: accountingKeys.payables.list(filters),
     queryFn: () => listPayables(filters),
+    enabled,
   });
 }
 
@@ -155,10 +162,11 @@ export function usePayable(payableId: number, enabled = true) {
 }
 
 /** Historial de cobros y pagos con filtros por fecha, destino y referencia. */
-export function usePayments(filters: PaymentFilters = {}) {
+export function usePayments(filters: PaymentFilters = {}, enabled = true) {
   return useQuery({
     queryKey: accountingKeys.payments.list(filters),
     queryFn: () => listPayments(filters),
+    enabled,
   });
 }
 
@@ -166,24 +174,28 @@ export function usePayments(filters: PaymentFilters = {}) {
 // Consultas — reportes financieros
 // --------------------------------------------------------------------------- //
 
-export function useTrialBalance(filters: ReportFilters = {}) {
+/** Cada reporte se consulta solo mientras su pestaña está activa. */
+export function useTrialBalance(filters: ReportFilters = {}, enabled = true) {
   return useQuery({
     queryKey: accountingKeys.reports.trialBalance(filters),
     queryFn: () => getTrialBalance(filters),
+    enabled,
   });
 }
 
-export function useBalanceSheet(filters: ReportFilters = {}) {
+export function useBalanceSheet(filters: ReportFilters = {}, enabled = true) {
   return useQuery({
     queryKey: accountingKeys.reports.balanceSheet(filters),
     queryFn: () => getBalanceSheet(filters),
+    enabled,
   });
 }
 
-export function useIncomeStatement(filters: ReportFilters = {}) {
+export function useIncomeStatement(filters: ReportFilters = {}, enabled = true) {
   return useQuery({
     queryKey: accountingKeys.reports.incomeStatement(filters),
     queryFn: () => getIncomeStatement(filters),
+    enabled,
   });
 }
 
