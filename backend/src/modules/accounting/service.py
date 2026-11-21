@@ -1,7 +1,8 @@
 """Servicios de dominio del módulo de Finanzas y Contabilidad.
 
 Implementa el Hito 3 de ``specs/accounting_spec.md`` para el Plan de Cuentas y
-el libro diario, y los hitos 4-5 de automatización contable y cartera:
+el libro diario, los hitos 4-5 de automatización contable y cartera, y el
+Hito 5 del apéndice de reportes financieros:
 
 * **Cuentas:** alta con ``code`` único, listado filtrable, actualización parcial,
   desactivación (borrado lógico) y bloqueo de borrado físico cuando la cuenta
@@ -23,6 +24,9 @@ el libro diario, y los hitos 4-5 de automatización contable y cartera:
   validan el saldo pendiente, actualizan ``paid_amount``, transicionan el estado
   y dejan un ``PaymentRecord`` con su asiento (reglas 5, 8 y 9 de la spec de
   aceptación).
+* **Reportes:** ``get_trial_balance``, ``get_balance_sheet`` y
+  ``get_income_statement`` agregan únicamente líneas de asientos ``POSTED``
+  dentro del rango de fechas o del periodo indicado (sección 4.6).
 
 Toda operación de escritura usa :func:`_atomic`, que confirma al finalizar y
 hace ``rollback`` ante cualquier excepción, de modo que un asiento desbalanceado,
@@ -49,6 +53,7 @@ from src.modules.accounting.models import (
     AccountBalanceStatus,
     AccountPayable,
     AccountReceivable,
+    AccountType,
     AccountingPeriod,
     JournalEntry,
     JournalEntryStatus,
@@ -58,10 +63,15 @@ from src.modules.accounting.models import (
 from src.modules.accounting.schemas import (
     AccountCreate,
     AccountUpdate,
+    BalanceSheetResponse,
+    IncomeStatementResponse,
     JournalEntryCreate,
     JournalEntryPostResponse,
     JournalItemCreate,
     PaymentCreate,
+    ReportAccountLine,
+    TrialBalanceLine,
+    TrialBalanceResponse,
 )
 from src.modules.purchasing.models import (
     GoodsReceipt,
@@ -98,7 +108,10 @@ __all__ = [
     "get_account",
     "get_account_payable",
     "get_account_receivable",
+    "get_balance_sheet",
+    "get_income_statement",
     "get_journal_entry",
+    "get_trial_balance",
     "list_account_payables",
     "list_account_receivables",
     "list_accounts",
@@ -2007,6 +2020,301 @@ def register_payable_payment(
         db.refresh(payment)
         db.refresh(balance)
     return PaymentResult(entry, payment, balance)
+
+
+# --------------------------------------------------------------------------- #
+# Reportes financieros — sección 4.6 de la spec / Hito 5 del apéndice
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class _AccountTotals:
+    """Sumas de débito y crédito de una cuenta dentro del periodo del reporte."""
+
+    account_id: int
+    code: str
+    name: str
+    account_type: AccountType
+    debit: Decimal
+    credit: Decimal
+
+    @property
+    def debit_balance(self) -> Decimal:
+        """Saldo natural de una cuenta de debe (activo o gasto)."""
+        return _money(self.debit - self.credit)
+
+    @property
+    def credit_balance(self) -> Decimal:
+        """Saldo natural de una cuenta de haber (pasivo, patrimonio o ingreso)."""
+        return _money(self.credit - self.debit)
+
+
+def _as_account_type(value: Any) -> AccountType | Any:
+    """Normaliza el tipo de cuenta leído de PostgreSQL o SQLite."""
+    if isinstance(value, AccountType):
+        return value
+    try:
+        return AccountType(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _resolve_report_window(
+    db: Session,
+    *,
+    date_from: date | None,
+    date_to: date | None,
+    period_id: int | None,
+    period_name: str | None,
+) -> tuple[date | None, date | None]:
+    """Combina el rango de fechas con el periodo contable indicado.
+
+    Si se dan ambos, se usa la intersección. Los periodos cerrados **sí** se
+    consultan: el control de periodos aplica a contabilizar, no a reportar.
+    """
+    if period_id is not None and period_name is not None:
+        raise AccountingError("Indique solo uno de period_id o period_name")
+
+    period: AccountingPeriod | None = None
+    if period_id is not None:
+        period = db.get(AccountingPeriod, period_id)
+        if period is None:
+            raise ResourceNotFoundError(
+                f"Periodo contable {period_id} no encontrado"
+            )
+    elif period_name is not None:
+        period = db.scalar(
+            select(AccountingPeriod).where(AccountingPeriod.name == period_name)
+        )
+        if period is None:
+            raise ResourceNotFoundError(
+                f"Periodo contable '{period_name}' no encontrado"
+            )
+
+    if period is not None:
+        date_from = (
+            period.start_date
+            if date_from is None
+            else max(date_from, period.start_date)
+        )
+        date_to = period.end_date if date_to is None else min(date_to, period.end_date)
+
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise AccountingError(
+            f"El rango del reporte es inválido: {date_from} es posterior a {date_to}"
+        )
+    return date_from, date_to
+
+
+def _posted_account_totals(
+    db: Session,
+    *,
+    date_from: date | None,
+    date_to: date | None,
+    period_id: int | None,
+    period_name: str | None,
+) -> list[_AccountTotals]:
+    """Agrega las líneas de asientos ``POSTED`` por cuenta.
+
+    ``DRAFT`` y ``VOID`` quedan fuera por construcción: el filtro se aplica al
+    encabezado del asiento antes de cualquier suma. Las cuentas desactivadas
+    siguen apareciendo si tienen movimientos históricos dentro del periodo.
+    """
+    start, end = _resolve_report_window(
+        db,
+        date_from=date_from,
+        date_to=date_to,
+        period_id=period_id,
+        period_name=period_name,
+    )
+    stmt = (
+        select(
+            Account.id,
+            Account.code,
+            Account.name,
+            Account.account_type,
+            func.coalesce(func.sum(JournalItem.debit), 0),
+            func.coalesce(func.sum(JournalItem.credit), 0),
+        )
+        .join(JournalItem, JournalItem.account_id == Account.id)
+        .join(JournalEntry, JournalEntry.id == JournalItem.journal_entry_id)
+        .where(JournalEntry.status == JournalEntryStatus.POSTED)
+        .group_by(Account.id, Account.code, Account.name, Account.account_type)
+        .order_by(Account.code, Account.id)
+    )
+    if start is not None:
+        stmt = stmt.where(JournalEntry.entry_date >= start)
+    if end is not None:
+        stmt = stmt.where(JournalEntry.entry_date <= end)
+
+    return [
+        _AccountTotals(
+            account_id=row[0],
+            code=row[1],
+            name=row[2],
+            account_type=_as_account_type(row[3]),
+            debit=_money(row[4]),
+            credit=_money(row[5]),
+        )
+        for row in db.execute(stmt).all()
+    ]
+
+
+def _report_line(row: _AccountTotals, balance: Decimal) -> ReportAccountLine:
+    """Construye una línea de balance o estado de resultados."""
+    return ReportAccountLine(
+        account_id=row.account_id,
+        code=row.code,
+        name=row.name,
+        balance=_money(max(Decimal("0.00"), balance)),
+    )
+
+
+def _sum_balances(lines: Sequence[ReportAccountLine]) -> Decimal:
+    """Suma los saldos de las líneas con precisión monetaria."""
+    return _money(sum((line.balance for line in lines), Decimal("0.00")))
+
+
+def get_trial_balance(
+    db: Session,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    *,
+    period_id: int | None = None,
+    period_name: str | None = None,
+) -> TrialBalanceResponse:
+    """Balance de comprobación de los asientos ``POSTED`` del periodo.
+
+    Devuelve débitos, créditos y saldo neto (``débito - crédito``) por cuenta.
+    El saldo puede ser negativo en cuentas de naturaleza acreedora; los totales
+    son las sumas brutas de ambos lados y por eso siempre son no negativos.
+    """
+    rows = _posted_account_totals(
+        db,
+        date_from=date_from,
+        date_to=date_to,
+        period_id=period_id,
+        period_name=period_name,
+    )
+    lines = [
+        TrialBalanceLine(
+            account_id=row.account_id,
+            code=row.code,
+            name=row.name,
+            account_type=row.account_type,
+            debit=row.debit,
+            credit=row.credit,
+            balance=row.debit_balance,
+        )
+        for row in rows
+    ]
+    return TrialBalanceResponse(
+        lines=lines,
+        total_debit=_money(sum((row.debit for row in rows), Decimal("0.00"))),
+        total_credit=_money(sum((row.credit for row in rows), Decimal("0.00"))),
+    )
+
+
+def get_balance_sheet(
+    db: Session,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    *,
+    period_id: int | None = None,
+    period_name: str | None = None,
+) -> BalanceSheetResponse:
+    """Balance General con activos, pasivos y patrimonio del periodo.
+
+    Cada cuenta se reporta con su saldo natural: débito menos crédito para los
+    activos, crédito menos débito para pasivos y patrimonio. ``difference`` es
+    ``Activo - (Pasivo + Patrimonio)``: permite verificar la ecuación contable
+    sin ocultar el resultado del periodo que aún no se ha cerrado a patrimonio.
+    Los saldos invertidos se reportan en cero porque el contrato de respuesta
+    exige totales no negativos.
+    """
+    rows = _posted_account_totals(
+        db,
+        date_from=date_from,
+        date_to=date_to,
+        period_id=period_id,
+        period_name=period_name,
+    )
+    assets: list[ReportAccountLine] = []
+    liabilities: list[ReportAccountLine] = []
+    equity: list[ReportAccountLine] = []
+    for row in rows:
+        if row.account_type is AccountType.ASSET:
+            target = assets
+            balance = row.debit_balance
+        elif row.account_type is AccountType.LIABILITY:
+            target = liabilities
+            balance = row.credit_balance
+        elif row.account_type is AccountType.EQUITY:
+            target = equity
+            balance = row.credit_balance
+        else:
+            continue
+        if balance != 0:
+            target.append(_report_line(row, balance))
+
+    total_assets = _sum_balances(assets)
+    total_liabilities = _sum_balances(liabilities)
+    total_equity = _sum_balances(equity)
+    total_liabilities_and_equity = _money(total_liabilities + total_equity)
+    return BalanceSheetResponse(
+        assets=assets,
+        liabilities=liabilities,
+        equity=equity,
+        total_assets=total_assets,
+        total_liabilities=total_liabilities,
+        total_equity=total_equity,
+        total_liabilities_and_equity=total_liabilities_and_equity,
+        difference=_money(total_assets - total_liabilities_and_equity),
+    )
+
+
+def get_income_statement(
+    db: Session,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    *,
+    period_id: int | None = None,
+    period_name: str | None = None,
+) -> IncomeStatementResponse:
+    """Estado de Resultados: ingresos, gastos y utilidad o pérdida del periodo.
+
+    Los ingresos se leen por su saldo natural acreedor y los gastos por su
+    saldo natural deudor. ``net_income`` puede ser negativo cuando el periodo
+    cierra con pérdida. Solo se consideran asientos ``POSTED``.
+    """
+    rows = _posted_account_totals(
+        db,
+        date_from=date_from,
+        date_to=date_to,
+        period_id=period_id,
+        period_name=period_name,
+    )
+    revenues: list[ReportAccountLine] = []
+    expenses: list[ReportAccountLine] = []
+    for row in rows:
+        if row.account_type is AccountType.REVENUE:
+            balance = row.credit_balance
+            if balance != 0:
+                revenues.append(_report_line(row, balance))
+        elif row.account_type is AccountType.EXPENSE:
+            balance = row.debit_balance
+            if balance != 0:
+                expenses.append(_report_line(row, balance))
+
+    total_revenue = _sum_balances(revenues)
+    total_expenses = _sum_balances(expenses)
+    return IncomeStatementResponse(
+        revenues=revenues,
+        expenses=expenses,
+        total_revenue=total_revenue,
+        total_expenses=total_expenses,
+        net_income=_money(total_revenue - total_expenses),
+    )
 
 
 # --------------------------------------------------------------------------- #
