@@ -40,6 +40,7 @@ El desarrollo del sistema sigue la metodología **Spec-Driven Development (SDD)*
 * 📦 **Diagramas de Inventario (`inventory`):** Arquitectura y flujos del módulo de inventario. — [Ver diagramas](docs/inventory_diagrams.md)
 * 💼 **Diagramas de Ventas y Facturación (`sales`):** Arquitectura y flujos del módulo de ventas y facturación. — [Ver diagramas](docs/sales_diagrams.md)
 * 🛒 **Diagrama de Compras y Proveedores (`purchasing`):** Arquitectura y flujos del módulo Compras. — [Ver diagramas](docs/purchasing_diagrams.md)
+* 📊 **Diagrama de Finanzas y Contabilidad (`accounting`):** Arquitectura y flujos del módulo Contabilidad. — [Ver diagramas](docs/accounting_diagrams.md)
 
 
 ---
