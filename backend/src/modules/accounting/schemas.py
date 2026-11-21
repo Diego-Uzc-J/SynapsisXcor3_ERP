@@ -60,6 +60,8 @@ __all__ = [
     "JournalItemCreate",
     "JournalItemResponse",
     "PaymentCreate",
+    "PaymentRecordRequest",
+    "PaymentRecordResponse",
     "ReportAccountLine",
     "StrictDecimal",
     "TrialBalanceLine",
@@ -446,6 +448,39 @@ class PaymentCreate(AccountingSchema):
                 "Debe indicar exactamente uno de receivable_id o payable_id"
             )
         return self
+
+
+class PaymentRecordRequest(AccountingSchema):
+    """Cuerpo para abonar una CxC o CxP cuyo id viaja en la URL."""
+
+    amount: StrictDecimal = Field(
+        gt=0,
+        max_digits=14,
+        decimal_places=2,
+        description="Monto del abono o pago, estrictamente positivo.",
+        examples=["400.00"],
+    )
+    payment_date: date = Field(
+        default_factory=date.today, description="Fecha en que se registró el pago."
+    )
+    reference: str | None = Field(
+        default=None,
+        max_length=100,
+        description="Comprobante o referencia bancaria.",
+    )
+
+
+class PaymentRecordResponse(AccountingResponseSchema):
+    """Abono o pago ya registrado, con trazabilidad del asiento generado."""
+
+    id: int
+    receivable_id: int | None
+    payable_id: int | None
+    journal_entry_id: int | None
+    amount: StrictDecimal
+    payment_date: date
+    reference: str | None
+    created_at: datetime
 
 
 # --------------------------------------------------------------------------- #
