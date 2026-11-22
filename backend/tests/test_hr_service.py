@@ -35,6 +35,7 @@ from src.modules.hr.models import (  # noqa: E402
     Employee,
 )
 from src.modules.hr.schemas import (  # noqa: E402
+    AttendanceCreate,
     ContractCreate,
     EmployeeCreate,
     EmployeeUpdate,
@@ -43,13 +44,16 @@ from src.modules.hr.service import (  # noqa: E402
     ActiveContractError,
     DuplicateIdentificationError,
     HRServiceError,
+    InvalidAttendanceError,
     InvalidEmployeeDataError,
     ResourceNotFoundError,
+    create_attendance,
     create_contract,
     create_employee,
     get_active_contract,
     get_employee,
     get_employee_profile,
+    list_attendance,
     list_contracts_by_employee,
     list_employees,
     update_employee,
@@ -316,3 +320,105 @@ def test_list_contracts_by_missing_employee_raises_404(db_session: Session) -> N
 def test_get_active_contract_returns_none_when_there_is_none(db_session: Session) -> None:
     employee = create_employee(db_session, employee_payload())
     assert get_active_contract(db_session, employee.id) is None
+
+
+# --------------------------------------------------------------------------- #
+# Asistencia
+# --------------------------------------------------------------------------- #
+
+
+def attendance_payload(employee_id: int, **overrides: Any) -> AttendanceCreate:
+    """Novedad válida por defecto, con horas extra decimales."""
+    values: dict[str, Any] = {
+        "employee_id": employee_id,
+        "date": _TODAY,
+        "status": AttendanceStatus.PRESENT,
+        "overtime_hours": Decimal("0.00"),
+        "notes": None,
+    }
+    values.update(overrides)
+    return AttendanceCreate(**values)
+
+
+def test_create_attendance_accepts_all_statuses(db_session: Session) -> None:
+    employee = create_employee(db_session, employee_payload())
+
+    for status in AttendanceStatus:
+        record = create_attendance(
+            db_session,
+            attendance_payload(
+                employee.id,
+                status=status,
+                overtime_hours=Decimal("2.50") if status is AttendanceStatus.OVERTIME else Decimal("0.00"),
+            ),
+        )
+        assert record.status is status
+        assert isinstance(record.overtime_hours, Decimal)
+
+
+def test_create_attendance_requires_existing_employee(db_session: Session) -> None:
+    with pytest.raises(ResourceNotFoundError):
+        create_attendance(db_session, attendance_payload(employee_id=999))
+
+
+def test_create_attendance_rejects_negative_hours_when_schema_is_bypassed(
+    db_session: Session,
+) -> None:
+    employee = create_employee(db_session, employee_payload())
+    invalid = AttendanceCreate.model_construct(
+        employee_id=employee.id,
+        date=_TODAY,
+        status=AttendanceStatus.OVERTIME,
+        overtime_hours=Decimal("-1.00"),
+        notes=None,
+    )
+
+    with pytest.raises(InvalidAttendanceError):
+        create_attendance(db_session, invalid)
+
+
+def test_list_attendance_filters_by_employee_date_and_range(db_session: Session) -> None:
+    first = create_employee(db_session, employee_payload())
+    second = create_employee(
+        db_session,
+        employee_payload(identification_number="900999999-9", email="otro@example.com"),
+    )
+    create_attendance(db_session, attendance_payload(first.id, date=date(2026, 3, 1)))
+    target = create_attendance(
+        db_session,
+        attendance_payload(
+            first.id,
+            date=date(2026, 3, 15),
+            status=AttendanceStatus.OVERTIME,
+            overtime_hours=Decimal("2.50"),
+        ),
+    )
+    create_attendance(db_session, attendance_payload(first.id, date=date(2026, 4, 1)))
+    create_attendance(db_session, attendance_payload(second.id, date=date(2026, 3, 10)))
+
+    assert len(list_attendance(db_session, employee_id=first.id)) == 3
+    assert [item.id for item in list_attendance(db_session, date=date(2026, 3, 15))] == [
+        target.id
+    ]
+    assert len(
+        list_attendance(
+            db_session,
+            employee_id=first.id,
+            start_date=date(2026, 3, 1),
+            end_date=date(2026, 3, 31),
+        )
+    ) == 2
+    assert len(
+        list_attendance(
+            db_session, start_date=date(2026, 3, 1), end_date=date(2026, 3, 31)
+        )
+    ) == 3
+
+
+def test_list_attendance_rejects_reversed_range(db_session: Session) -> None:
+    with pytest.raises(InvalidAttendanceError):
+        list_attendance(
+            db_session,
+            start_date=date(2026, 3, 31),
+            end_date=date(2026, 3, 1),
+        )

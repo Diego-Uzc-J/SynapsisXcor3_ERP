@@ -1,7 +1,8 @@
 """Servicios de dominio del módulo de Recursos Humanos y Nómina.
 
-Implementa, para el Hito 2 de ``specs/hr_spec.md``, la capa de servicio de
-empleados y contratos (secciones 2.1, 2.2, 3.1, 3.6, 4.1 y 4.2):
+Implementa, para los Hitos 2 y 3 de ``specs/hr_spec.md``, la capa de servicio
+de empleados, contratos y asistencia (secciones 2.1, 2.2, 2.3, 3.1, 3.6, 4.1,
+4.2 y 4.3):
 
 * **Empleados:** alta con ``identification_number`` único (regla 6), listado
   filtrable por ``is_active``, perfil con historial laboral (contratos y
@@ -12,11 +13,18 @@ empleados y contratos (secciones 2.1, 2.2, 3.1, 3.6, 4.1 y 4.2):
   exige el escenario 2 de aceptación.
 * **Historial:** consulta de contratos por ``employee_id`` y del contrato
   activo vigente, que servirá de base para el cálculo de nómina.
+* **Asistencia:** registro de ``PRESENT``, ``ABSENT``, ``SICK_LEAVE``,
+  ``VACATION`` y ``OVERTIME`` exigiendo empleado existente y horas extra no
+  negativas (sección 4.3), con filtros por empleado, fecha exacta o rango de
+  periodo. Cada operación tiene una variante síncrona (``Session``) y otra
+  asíncrona (``AsyncSession``) que comparten validación y construcción de la
+  consulta.
 
-Todas las escrituras usan :func:`_atomic`, que confirma al finalizar y revierte
-cualquier cambio ante un error de negocio o de integridad. Las excepciones
-derivan de ``fastapi.HTTPException`` con ``status_code`` 400/404, por lo que son
-mapeables directamente por FastAPI sin un manejador adicional.
+Todas las escrituras usan :func:`_atomic` o :func:`_atomic_async`, que confirman
+al finalizar y revierten cualquier cambio ante un error de negocio o de
+integridad. Las excepciones derivan de ``fastapi.HTTPException`` con
+``status_code`` 400/404, por lo que son mapeables directamente por FastAPI sin
+un manejador adicional.
 
 La exclusividad se comprueba en servicio y se serializa bloqueando la fila del
 empleado (``SELECT ... FOR UPDATE``) dentro de la transacción; el índice único
@@ -26,17 +34,21 @@ por carrera entre peticiones concurrentes.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-from datetime import date
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from datetime import date as date_type
+from decimal import Decimal, InvalidOperation
 
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.sql import Select
 
-from src.modules.hr.models import Contract, Employee
+from src.modules.hr.models import Attendance, AttendanceStatus, Contract, Employee
 from src.modules.hr.schemas import (
+    AttendanceCreate,
     ContractCreate,
     EmployeeCreate,
     EmployeeResponse,
@@ -47,14 +59,19 @@ __all__ = [
     "ActiveContractError",
     "DuplicateIdentificationError",
     "HRServiceError",
+    "InvalidAttendanceError",
     "InvalidEmployeeDataError",
     "ResourceNotFoundError",
+    "create_attendance",
+    "create_attendance_async",
     "create_contract",
     "create_employee",
     "get_active_contract",
     "get_contract",
     "get_employee",
     "get_employee_profile",
+    "list_attendance",
+    "list_attendance_async",
     "list_contracts_by_employee",
     "list_employees",
     "update_employee",
@@ -103,6 +120,12 @@ class ActiveContractError(HRServiceError):
     status_code = 400
 
 
+class InvalidAttendanceError(HRServiceError):
+    """La novedad de asistencia no cumple la spec (estado, horas o rango)."""
+
+    status_code = 400
+
+
 # --------------------------------------------------------------------------- #
 # Utilidades internas y control transaccional
 # --------------------------------------------------------------------------- #
@@ -116,6 +139,17 @@ def _atomic(db: Session) -> Iterator[None]:
         db.commit()
     except Exception:
         db.rollback()
+        raise
+
+
+@asynccontextmanager
+async def _atomic_async(db: AsyncSession) -> AsyncIterator[None]:
+    """Equivalente asíncrono de :func:`_atomic` para ``AsyncSession``."""
+    try:
+        yield
+        await db.commit()
+    except Exception:
+        await db.rollback()
         raise
 
 
@@ -148,7 +182,7 @@ def _ensure_unique_identification(
         )
 
 
-def _ensure_employee_dates(birth_date: date, hire_date: date) -> None:
+def _ensure_employee_dates(birth_date: date_type, hire_date: date_type) -> None:
     """Exige que la fecha de nacimiento no sea posterior al ingreso."""
     if birth_date > hire_date:
         raise InvalidEmployeeDataError(
@@ -156,7 +190,7 @@ def _ensure_employee_dates(birth_date: date, hire_date: date) -> None:
         )
 
 
-def _ensure_contract_dates(start_date: date, end_date: date | None) -> None:
+def _ensure_contract_dates(start_date: date_type, end_date: date_type | None) -> None:
     """Exige que ``end_date`` sea igual o posterior a ``start_date``."""
     if end_date is not None and end_date < start_date:
         raise InvalidEmployeeDataError(
@@ -172,6 +206,65 @@ def _find_active_contract(db: Session, employee_id: int) -> Contract | None:
         .order_by(Contract.start_date.desc(), Contract.id.desc())
     )
     return db.scalars(stmt.limit(1)).first()
+
+
+async def _ensure_employee_async(db: AsyncSession, employee_id: int) -> Employee:
+    """Obtiene un empleado con ``AsyncSession`` o lanza ``ResourceNotFoundError``."""
+    employee = await db.get(Employee, employee_id)
+    if employee is None:
+        raise ResourceNotFoundError(f"Empleado {employee_id} no encontrado")
+    return employee
+
+
+def _ensure_attendance_data(data: AttendanceCreate) -> None:
+    """Valida estado y horas extra aunque el llamador haya sorteado el esquema."""
+    if not isinstance(data.status, AttendanceStatus):
+        raise InvalidAttendanceError(
+            f"Estado de asistencia no válido: {data.status!r}"
+        )
+    try:
+        overtime_hours = Decimal(str(data.overtime_hours))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise InvalidAttendanceError(
+            "overtime_hours debe ser un valor decimal"
+        ) from exc
+    if overtime_hours < 0:
+        raise InvalidAttendanceError("overtime_hours no puede ser negativo")
+
+
+def _ensure_attendance_range(
+    start_date: date_type | None, end_date: date_type | None
+) -> None:
+    """Rechaza rangos de periodo invertidos."""
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise InvalidAttendanceError(
+            "start_date no puede ser posterior a end_date"
+        )
+
+
+def _attendance_statement(
+    *,
+    employee_id: int | None = None,
+    date: date_type | None = None,
+    start_date: date_type | None = None,
+    end_date: date_type | None = None,
+) -> Select[Attendance]:
+    """Construye la consulta de asistencia con todos los filtros aplicados.
+
+    Los filtros se combinan con ``AND``: ``date`` acota a un día exacto, mientras
+    que ``start_date``/``end_date`` acotan el periodo, ambos inclusivos.
+    """
+    _ensure_attendance_range(start_date, end_date)
+    stmt = select(Attendance)
+    if employee_id is not None:
+        stmt = stmt.where(Attendance.employee_id == employee_id)
+    if date is not None:
+        stmt = stmt.where(Attendance.date == date)
+    if start_date is not None:
+        stmt = stmt.where(Attendance.date >= start_date)
+    if end_date is not None:
+        stmt = stmt.where(Attendance.date <= end_date)
+    return stmt.order_by(Attendance.date, Attendance.id)
 
 
 def _raise_duplicate_identification(identification: str, exc: IntegrityError) -> None:
@@ -329,3 +422,84 @@ def list_contracts_by_employee(
     stmt = stmt.order_by(Contract.start_date.desc(), Contract.id.desc())
     stmt = stmt.offset(skip).limit(limit)
     return list(db.scalars(stmt).all())
+
+
+# --------------------------------------------------------------------------- #
+# Asistencia — /api/v1/hr/attendance
+# --------------------------------------------------------------------------- #
+
+
+def create_attendance(db: Session, data: AttendanceCreate) -> Attendance:
+    """Registra una novedad de asistencia para un empleado existente.
+
+    Se aceptan los cinco estados de la spec y se exige ``overtime_hours >= 0``;
+    la validación se repite en servicio para no depender de que el llamador haya
+    pasado por Pydantic. Devuelve el registro persistido con su ``Decimal``.
+    """
+    _ensure_attendance_data(data)
+    with _atomic(db):
+        _get_employee_row(db, data.employee_id)
+        record = Attendance(**data.model_dump())
+        db.add(record)
+    db.refresh(record)
+    return record
+
+
+def list_attendance(
+    db: Session,
+    *,
+    employee_id: int | None = None,
+    date: date_type | None = None,
+    start_date: date_type | None = None,
+    end_date: date_type | None = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[Attendance]:
+    """Consulta asistencia por empleado, fecha exacta o rango de periodo."""
+    if employee_id is not None:
+        _get_employee_row(db, employee_id)
+    stmt = _attendance_statement(
+        employee_id=employee_id,
+        date=date,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    stmt = stmt.offset(skip).limit(limit)
+    return list(db.scalars(stmt).all())
+
+
+async def create_attendance_async(
+    db: AsyncSession, data: AttendanceCreate
+) -> Attendance:
+    """Variante asíncrona de :func:`create_attendance` para ``AsyncSession``."""
+    _ensure_attendance_data(data)
+    async with _atomic_async(db):
+        await _ensure_employee_async(db, data.employee_id)
+        record = Attendance(**data.model_dump())
+        db.add(record)
+    await db.refresh(record)
+    return record
+
+
+async def list_attendance_async(
+    db: AsyncSession,
+    *,
+    employee_id: int | None = None,
+    date: date_type | None = None,
+    start_date: date_type | None = None,
+    end_date: date_type | None = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[Attendance]:
+    """Variante asíncrona de :func:`list_attendance` con los mismos filtros."""
+    if employee_id is not None:
+        await _ensure_employee_async(db, employee_id)
+    stmt = _attendance_statement(
+        employee_id=employee_id,
+        date=date,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    stmt = stmt.offset(skip).limit(limit)
+    result = await db.scalars(stmt)
+    return list(result.all())
