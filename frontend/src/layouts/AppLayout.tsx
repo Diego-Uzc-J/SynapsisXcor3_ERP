@@ -1,9 +1,10 @@
-import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
 
 import { initials, ROLE_LABELS } from "../modules/users/constants";
 import {
   accessibleModules,
   ACCOUNTING_LINKS,
+  canOpenModule,
   HR_LINKS,
   INVENTORY_LINKS,
   MANUFACTURING_LINKS,
@@ -60,34 +61,15 @@ export default function AppLayout() {
   );
   const isInventoryReadOnly =
     user !== null && !canWriteModule(user, "inventory");
-  // Las rutas sales exigen además el rol `sales` (o administrador); ocultar
-  // los enlaces evita mostrar destinos que el router rechazaría con 403.
-  const canOpenSales =
-    sales !== undefined &&
-    user !== null &&
-    (user.role.name === "administrator" || user.role.name === "sales");
-  // Igual que en ventas, las rutas exigen además el rol `purchasing`.
-  const canOpenPurchasing =
-    purchasing !== undefined &&
-    user !== null &&
-    (user.role.name === "administrator" || user.role.name === "purchasing");
-  // Igual que ventas y compras, las rutas exigen además el rol `accounting`.
-  const canOpenAccounting =
-    accounting !== undefined &&
-    user !== null &&
-    (user.role.name === "administrator" || user.role.name === "accounting");
-  // Igual que ventas, compras y contabilidad, las rutas de RRHH exigen además
-  // el rol `hr` (o administrador); el backend aplica la misma regla.
-  const canOpenHr =
-    hr !== undefined &&
-    user !== null &&
-    (user.role.name === "administrator" || user.role.name === "hr");
-  // Las rutas de manufactura exigen además el rol `manufacturing` (o admin),
-  // igual que el guardia RequireRole y el router FastAPI.
+  // Las rutas de estos módulos exigen además el rol exacto (o administrador),
+  // igual que `RequireRole` y el router FastAPI. Ocultar los enlaces evita
+  // mostrar destinos que el frontend rechazaría con 403.
+  const canOpenSales = user !== null && canOpenModule(user, "sales");
+  const canOpenPurchasing = user !== null && canOpenModule(user, "purchasing");
+  const canOpenAccounting = user !== null && canOpenModule(user, "accounting");
+  const canOpenHr = user !== null && canOpenModule(user, "hr");
   const canOpenManufacturing =
-    manufacturing !== undefined &&
-    user !== null &&
-    (user.role.name === "administrator" || user.role.name === "manufacturing");
+    user !== null && canOpenModule(user, "manufacturing");
 
   const mobileLinks = [
     ...(inventory === undefined
@@ -128,14 +110,20 @@ export default function AppLayout() {
     <div className="min-h-screen bg-concrete-50 text-ink-950 md:flex">
       <aside className="sticky top-0 hidden h-screen w-20 shrink-0 flex-col justify-between bg-ink-950 px-3 py-6 md:flex lg:w-60 lg:px-5">
         <div className="min-h-0 overflow-y-auto">
-          <div className="mb-10 flex items-center gap-3">
-            <span className="grid size-10 shrink-0 place-items-center bg-signal-500 text-base font-extrabold tracking-tight text-white">
-              SX
-            </span>
-            <div className="hidden lg:block">
-              <p className="text-sm font-semibold text-concrete-50">SynapsisXcor3</p>
-              <p className="text-xs text-concrete-400">ERP modular</p>
-            </div>
+          <div className="mb-10">
+            <Link to="/" className="flex items-center gap-3" aria-label="Ir al hub del ERP">
+              <span className="grid size-10 shrink-0 place-items-center bg-signal-500 text-base font-extrabold tracking-tight text-white">
+                SX
+              </span>
+              <span className="hidden lg:block">
+                <span className="block text-sm font-semibold text-concrete-50">
+                  SynapsisXcor3
+                </span>
+                <span className="block text-xs text-concrete-400">
+                  ERP modular
+                </span>
+              </span>
+            </Link>
           </div>
 
           <nav aria-label="Navegación principal" className="space-y-1">
@@ -349,12 +337,12 @@ export default function AppLayout() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex items-center justify-between gap-4 border-b border-concrete-200 px-4 py-3 md:hidden">
-          <div className="flex shrink-0 items-center gap-2.5">
+          <Link to="/" className="flex shrink-0 items-center gap-2.5" aria-label="Ir al hub del ERP">
             <span className="grid size-8 place-items-center bg-signal-500 text-xs font-extrabold tracking-tight text-white">
               SX
             </span>
             <span className="text-sm font-semibold">SynapsisXcor3 ERP</span>
-          </div>
+          </Link>
           <div className="flex min-w-0 items-center gap-3">
             <nav
               aria-label="Navegación principal"
@@ -384,6 +372,30 @@ export default function AppLayout() {
         <main className="min-w-0 flex-1">
           <Outlet />
         </main>
+
+        <footer className="border-t border-concrete-200 px-4 py-3 text-[0.6875rem] text-concrete-400 sm:px-6">
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
+            <span>SynapsisXcor3 ERP · Monolito modular</span>
+            <nav aria-label="Enlaces del proyecto" className="flex items-center gap-4">
+              <a
+                href="https://www.linkedin.com/in/diego-uzc-j/"
+                target="_blank"
+                rel="noreferrer"
+                className="hover:text-ink-950"
+              >
+                LinkedIn
+              </a>
+              <a
+                href="https://github.com/Diego-Uzc-J/SynapsisXcor3_ERP"
+                target="_blank"
+                rel="noreferrer"
+                className="hover:text-ink-950"
+              >
+                GitHub
+              </a>
+            </nav>
+          </div>
+        </footer>
       </div>
     </div>
   );

@@ -208,9 +208,7 @@ export function moduleByKey(key: ModuleKey): ModuleDefinition {
 
 /** Primer destino navegable según `allowed_modules`; nunca deja un callejón. */
 export function firstAccessiblePath(user: AuthUser): string {
-  const definition = MODULES.find((module) =>
-    hasModuleAccess(user, module.key),
-  );
+  const definition = MODULES.find((module) => canOpenModule(user, module.key));
   return definition?.path ?? "/sin-acceso";
 }
 
@@ -233,13 +231,38 @@ export function safeReturnPath(
       requestedPath === module.path ||
       requestedPath.startsWith(`${module.path}/`),
   );
-  if (definition !== undefined && hasModuleAccess(user, definition.key)) {
+  if (definition !== undefined && canOpenModule(user, definition.key)) {
     return requestedPath;
   }
   return firstAccessiblePath(user);
 }
 
+/**
+ * Módulos cuyas rutas exigen además el rol exacto (o administrador).
+ *
+ * Un permiso `modulo:read` permite consultar la API, pero las vistas de la SPA
+ * están protegidas por `RequireRole`; mostrarlas como enlaces daría un 403.
+ */
+const ROLE_SCOPED_MODULES: readonly ModuleKey[] = [
+  "sales",
+  "purchasing",
+  "accounting",
+  "hr",
+  "manufacturing",
+];
+
+/** Indica si la SPA puede abrir la ruta del módulo con este perfil. */
+export function canOpenModule(user: AuthUser, key: ModuleKey): boolean {
+  if (!hasModuleAccess(user, key)) {
+    return false;
+  }
+  if (user.role.name === "administrator") {
+    return true;
+  }
+  return !ROLE_SCOPED_MODULES.includes(key) || user.role.name === key;
+}
+
 /** Destinos que se muestran en el menú lateral para este perfil. */
 export function accessibleModules(user: AuthUser): ModuleDefinition[] {
-  return MODULES.filter((module) => hasModuleAccess(user, module.key));
+  return MODULES.filter((module) => canOpenModule(user, module.key));
 }

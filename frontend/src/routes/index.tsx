@@ -31,7 +31,8 @@ import SalesOrderList from "../modules/sales/SalesOrderList";
 import LoginPage from "../modules/users/LoginPage";
 import UserList from "../modules/users/UserList";
 import AccessDenied from "./AccessDenied";
-import { IndexRedirect, RequireAuth, RequireModule, RequireRole } from "./guards";
+import { RequireAuth, RequireModule, RequireRole } from "./guards";
+import ModuleHub from "./ModuleHub";
 
 export const router = createBrowserRouter([
   {
@@ -45,7 +46,7 @@ export const router = createBrowserRouter([
         path: "/",
         element: <AppLayout />,
         children: [
-          { index: true, element: <IndexRedirect /> },
+          { index: true, element: <ModuleHub /> },
 
           {
             element: <RequireModule module="inventory" />,
