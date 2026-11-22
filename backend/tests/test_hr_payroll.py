@@ -27,6 +27,11 @@ if str(BACKEND_ROOT) not in sys.path:
 os.environ.setdefault("DATABASE_URL", "sqlite://")
 
 from src.core.database import Base  # noqa: E402
+from src.modules.accounting.models import AccountType  # noqa: E402
+from src.modules.accounting.schemas import AccountCreate  # noqa: E402
+from src.modules.accounting.service import (  # noqa: E402
+    create_account as create_accounting_account,
+)
 from src.modules.hr.models import (  # noqa: E402
     AttendanceStatus,
     ContractType,
@@ -143,6 +148,24 @@ def count_runs(db: Session) -> int:
 
 def count_payslips(db: Session) -> int:
     return int(db.scalar(select(func.count()).select_from(Payslip)) or 0)
+
+
+def seed_payroll_accounts(db: Session) -> None:
+    """PUC mínimo usado por la integración contable de nómina."""
+    create_accounting_account(
+        db,
+        AccountCreate(
+            code="5100", name="Gastos de personal", account_type=AccountType.EXPENSE
+        ),
+    )
+    create_accounting_account(
+        db,
+        AccountCreate(
+            code="220505",
+            name="Cuentas por pagar de nómina",
+            account_type=AccountType.LIABILITY,
+        ),
+    )
 
 
 def test_create_payroll_run_calculates_decimal_payslips_and_totals(
@@ -352,6 +375,7 @@ def test_payroll_run_is_immutable_after_approval_or_paid(
 ) -> None:
     employee = create_employee(db_session, employee_payload(1))
     create_contract(db_session, contract_payload(employee.id))
+    seed_payroll_accounts(db_session)
     run = create_payroll_run(
         db_session,
         payroll_payload(),

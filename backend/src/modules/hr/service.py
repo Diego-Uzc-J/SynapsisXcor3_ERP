@@ -23,7 +23,10 @@ de empleados, contratos, asistencia y nómina (secciones 2.1 a 2.5, 3.1 a 3.3,
   empleados activos con contrato activo vigente en el periodo (reglas 2, 3 y 6,
   escenarios 1, 3, 5 y 6). Los importes se calculan solo con ``Decimal`` y se
   cuantizan a 2 decimales con ``ROUND_HALF_UP``; los totales se suman desde los
-  desprendibles ya redondeados para que la agregación sea exacta.
+  desprendibles ya redondeados para que la agregación sea exacta. La aprobación
+  (regla 4, escenario 4) usa ``accounting.post_payroll_run_accounting`` con
+  ``commit=False`` para crear el asiento y marcar el periodo como ``APPROVED``
+  en la **misma** transacción; cualquier fallo revierte ambos.
 
 Las fórmulas adoptadas, necesarias porque la spec no fija tarifas, son:
 
@@ -67,6 +70,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import Select
 
+from src.modules.accounting.service import post_payroll_run_accounting
 from src.modules.hr.models import (
     Attendance,
     AttendanceStatus,
@@ -96,6 +100,7 @@ __all__ = [
     "InvalidAttendanceError",
     "InvalidEmployeeDataError",
     "InvalidPayrollDataError",
+    "PayrollAccountingError",
     "ResourceNotFoundError",
     "approve_payroll_run",
     "create_attendance",
@@ -187,6 +192,12 @@ class ImmutablePayrollRunError(HRServiceError):
     status_code = 409
 
 
+class PayrollAccountingError(HRServiceError):
+    """Falló la contabilización al aprobar; la transacción fue revertida."""
+
+    status_code = 400
+
+
 # --------------------------------------------------------------------------- #
 # Constantes de cálculo de nómina
 # --------------------------------------------------------------------------- #
@@ -210,10 +221,10 @@ _ZERO_MONEY = Decimal("0.00")
 #: Estados que todavía permiten recalcular o transicionar un periodo.
 _MUTABLE_PAYROLL_STATUSES = frozenset({PayrollRunStatus.DRAFT})
 
-#: Estados a los que puede transicionar un periodo libre de la API de servicio.
-_ALLOWED_PAYROLL_TARGET_STATUSES = frozenset(
-    {PayrollRunStatus.APPROVED, PayrollRunStatus.PAID}
-)
+#: Estados a los que puede transicionar ``set_payroll_run_status``.
+#: ``APPROVED`` solo se alcanza vía :func:`approve_payroll_run`, que exige el
+#: asiento contable en la misma transacción (regla 4).
+_ALLOWED_PAYROLL_TARGET_STATUSES = frozenset({PayrollRunStatus.PAID})
 
 
 # --------------------------------------------------------------------------- #
@@ -483,6 +494,67 @@ def _ensure_payroll_mutable(payroll_run: PayrollRun) -> None:
             "inmutable; cree una nómina de ajuste (is_adjustment=True) para "
             "corregirlo"
         )
+
+
+def _ensure_payroll_postable(payroll_run: PayrollRun) -> tuple[Decimal, Decimal, Decimal]:
+    """Valida que el periodo sea contabilizable y devuelve sus tres totales.
+
+    Además de exigir ``DRAFT`` (vía :func:`_ensure_payroll_mutable` en el
+    llamador), comprueba que existan desprendibles, que el devengado sea
+    positivo y que los totales del encabezado coincidan exactamente con la suma
+    de los desprendibles ya redondeados.
+    """
+    if not payroll_run.payslips:
+        raise InvalidPayrollDataError(
+            f"El periodo '{payroll_run.code}' no tiene desprendibles contabilizables"
+        )
+
+    earnings = _quantize_money(
+        _as_decimal(
+            payroll_run.total_earnings,
+            field="total_earnings",
+            maximum=_MAX_MONEY,
+        )
+    )
+    deductions = _quantize_money(
+        _as_decimal(
+            payroll_run.total_deductions,
+            field="total_deductions",
+            maximum=_MAX_MONEY,
+        )
+    )
+    net = _quantize_money(
+        _as_decimal(
+            payroll_run.total_net, field="total_net", maximum=_MAX_MONEY
+        )
+    )
+    if earnings <= 0:
+        raise InvalidPayrollDataError(
+            f"El periodo '{payroll_run.code}' no tiene un devengado positivo"
+        )
+    if net != earnings - deductions:
+        raise InvalidPayrollDataError(
+            f"Los totales del periodo '{payroll_run.code}' son incoherentes: "
+            f"{net} != {earnings} - {deductions}"
+        )
+
+    payslip_earnings = sum(
+        (item.earnings for item in payroll_run.payslips), _ZERO_MONEY
+    )
+    payslip_deductions = sum(
+        (item.deductions for item in payroll_run.payslips), _ZERO_MONEY
+    )
+    payslip_net = sum((item.net_pay for item in payroll_run.payslips), _ZERO_MONEY)
+    if (
+        _quantize_money(payslip_earnings) != earnings
+        or _quantize_money(payslip_deductions) != deductions
+        or _quantize_money(payslip_net) != net
+    ):
+        raise InvalidPayrollDataError(
+            f"Los totales del periodo '{payroll_run.code}' no coinciden con sus "
+            "desprendibles"
+        )
+    return earnings, deductions, net
 
 
 def _eligible_payroll_employees(
@@ -989,11 +1061,12 @@ def recalculate_payroll_run(
 def set_payroll_run_status(
     db: Session, payroll_run_id: int, status: PayrollRunStatus
 ) -> PayrollRun:
-    """Transiciona un periodo ``DRAFT`` a ``APPROVED`` o ``PAID``.
+    """Transiciona un periodo ``DRAFT`` a ``PAID``.
 
-    La aprobación queda registrada en ``approved_at``. Un periodo ya aprobado
-    o pagado no puede cambiar de estado: la corrección exige una nueva nómina
-    de ajuste (regla 3, escenario 3).
+    ``APPROVED`` **no** se puede fijar aquí: ese estado exige el asiento
+    contable de :func:`approve_payroll_run` (regla 4). Un periodo ya aprobado o
+    pagado no puede cambiar de estado; la corrección exige una nueva nómina de
+    ajuste (regla 3, escenario 3).
     """
     try:
         target = PayrollRunStatus(status)
@@ -1003,20 +1076,73 @@ def set_payroll_run_status(
         ) from exc
     if target not in _ALLOWED_PAYROLL_TARGET_STATUSES:
         raise InvalidPayrollDataError(
-            "Desde DRAFT solo se puede transicionar a APPROVED o PAID"
+            "Desde DRAFT solo se puede transicionar a PAID; para APPROVED use "
+            "approve_payroll_run, que genera el asiento contable"
         )
 
     with _atomic(db):
         payroll_run = _get_payroll_run_row(db, payroll_run_id, for_update=True)
         _ensure_payroll_mutable(payroll_run)
         payroll_run.status = target
-        if target is PayrollRunStatus.APPROVED:
-            payroll_run.approved_at = datetime.now(timezone.utc)
 
     db.refresh(payroll_run)
     return payroll_run
 
 
-def approve_payroll_run(db: Session, payroll_run_id: int) -> PayrollRun:
-    """Aprueba un periodo en borrador (sin contabilizar; escenario 4 aparte)."""
-    return set_payroll_run_status(db, payroll_run_id, PayrollRunStatus.APPROVED)
+def approve_payroll_run(
+    db: Session,
+    payroll_run_id: int,
+    *,
+    expense_account_id: int | None = None,
+    payable_account_id: int | None = None,
+    deductions_account_id: int | None = None,
+    created_by: str | None = None,
+) -> PayrollRun:
+    """Aprueba un periodo ``DRAFT`` y contabiliza su nómina de forma atómica.
+
+    Dentro de una única unidad de trabajo se generan las líneas de gasto de
+    personal y pasivo, se publica el asiento en ``accounting`` con
+    ``commit=False`` y se marcan ``status=APPROVED``/``approved_at``. Si la
+    contabilización falla, :func:`_atomic` revierte el asiento y el cambio de
+    estado; el periodo sigue en ``DRAFT`` sin movimientos parciales (regla 4,
+    escenario 4).
+    """
+    initial = _get_payroll_run_row(db, payroll_run_id, with_payslips=True)
+    _ensure_payroll_mutable(initial)
+    payroll_code = initial.code
+    earnings, deductions, net = _ensure_payroll_postable(initial)
+
+    try:
+        with _atomic(db):
+            payroll_run = _get_payroll_run_row(
+                db, payroll_run_id, for_update=True, with_payslips=True
+            )
+            # Se repiten las comprobaciones dentro de la transacción para no
+            # aprobar un periodo modificado entre la lectura y el bloqueo.
+            _ensure_payroll_mutable(payroll_run)
+            earnings, deductions, net = _ensure_payroll_postable(payroll_run)
+
+            post_payroll_run_accounting(
+                db,
+                code=payroll_run.code,
+                entry_date=payroll_run.period_end,
+                total_earnings=earnings,
+                total_deductions=deductions,
+                total_net=net,
+                expense_account_id=expense_account_id,
+                payable_account_id=payable_account_id,
+                deductions_account_id=deductions_account_id,
+                created_by=created_by,
+                commit=False,
+            )
+            payroll_run.status = PayrollRunStatus.APPROVED
+            payroll_run.approved_at = datetime.now(timezone.utc)
+    except HRServiceError:
+        raise
+    except Exception as exc:
+        raise PayrollAccountingError(
+            f"No se pudo contabilizar la nómina '{payroll_code}': {exc}"
+        ) from exc
+
+    db.refresh(payroll_run)
+    return payroll_run

@@ -118,6 +118,7 @@ __all__ = [
     "list_journal_entries",
     "list_payment_records",
     "post_journal_entry",
+    "post_payroll_run_accounting",
     "post_purchase_receipt_accounting",
     "post_sales_credit_note_accounting",
     "post_sales_invoice_accounting",
@@ -148,6 +149,7 @@ _AUTO_CODE_LOCK_BASES: dict[str, int] = {
     "ASI-FCP": 8_410_300,
     "ASI-COB": 8_410_400,
     "ASI-PAG": 8_410_500,
+    "ASI-NOM": 8_410_600,
 }
 
 #: Mapeo por defecto de roles contables a códigos del PUC. Se usa solo cuando el
@@ -1171,6 +1173,7 @@ _LABEL_RECEIPT = "Recepcion compra"
 _LABEL_BILL = "Factura proveedor"
 _LABEL_RECEIVABLE_PAYMENT = "Cobro CxC"
 _LABEL_PAYABLE_PAYMENT = "Pago CxP"
+_LABEL_PAYROLL = "Nomina"
 
 
 def _status_value(value: Any) -> Any:
@@ -1689,6 +1692,110 @@ def post_supplier_bill_accounting(
         db.refresh(entry)
         db.refresh(balance)
     return AccountingResult(entry, balance)
+
+
+def post_payroll_run_accounting(
+    db: Session,
+    *,
+    code: str,
+    entry_date: date,
+    total_earnings: Decimal,
+    total_deductions: Decimal,
+    total_net: Decimal,
+    expense_account_id: int | None = None,
+    payable_account_id: int | None = None,
+    deductions_account_id: int | None = None,
+    created_by: str | None = None,
+    commit: bool = True,
+) -> AccountingResult:
+    """Contabiliza una nómina: debita gasto de personal y acredita pasivos.
+
+    El asiento debita la cuenta de gasto por el total devengado y acredita:
+
+    * la cuenta por pagar de nómina por el neto a pagar;
+    * la cuenta de pasivo laboral por las deducciones, cuando las hay. Si no se
+      configura ``deductions_account_id``, se usa la misma cuenta ``payable``.
+
+    La partida doble se valida antes de fijar ``POSTED``. Con ``commit=False``
+    el llamador (por ejemplo ``hr.approve_payroll_run``) incluye el asiento en
+    su propia unidad de trabajo; con el valor por defecto la función confirma
+    y revierte por sí misma. Es idempotente por el código del periodo.
+    """
+    earnings = _money(total_earnings)
+    deductions = _money(total_deductions)
+    net = _money(total_net)
+
+    if earnings <= 0:
+        raise InvalidJournalEntryError(
+            f"La nómina '{code}' no tiene un total devengado contabilizable"
+        )
+    if deductions < 0 or net < 0:
+        raise InvalidJournalEntryError(
+            f"La nómina '{code}' tiene deducciones o neto negativos"
+        )
+    if net != earnings - deductions:
+        raise InvalidJournalEntryError(
+            f"La nómina '{code}' no es consistente: neto {net} != "
+            f"devengado {earnings} - deducciones {deductions}"
+        )
+    for label, amount in (
+        ("devengado de la nómina", earnings),
+        ("deducciones de la nómina", deductions),
+        ("neto de la nómina", net),
+    ):
+        _ensure_money_range(amount, label=label)
+
+    expense_id = _resolve_account_id(db, "expense", expense_account_id)
+    payable_id = _resolve_account_id(db, "payable", payable_account_id)
+    deductions_id = _resolve_account_id(db, "payable", deductions_account_id)
+
+    items = [
+        JournalItemCreate(
+            account_id=expense_id,  # type: ignore[arg-type]
+            debit=earnings,
+            credit=Decimal("0.00"),
+            description=f"Gasto personal nomina {code}",
+        ),
+        JournalItemCreate(
+            account_id=payable_id,  # type: ignore[arg-type]
+            debit=Decimal("0.00"),
+            credit=net,
+            description=f"CxP nomina {code}",
+        ),
+    ]
+    if deductions > 0:
+        items.append(
+            JournalItemCreate(
+                account_id=deductions_id,  # type: ignore[arg-type]
+                debit=Decimal("0.00"),
+                credit=deductions,
+                description=f"Deducciones nomina {code}",
+            )
+        )
+
+    with _unit_of_work(db, commit=commit):
+        existing = _find_generated_entry(
+            db, reference=code, label=_LABEL_PAYROLL
+        )
+        if existing is not None:
+            return AccountingResult(existing, None)
+
+        entry_code = _next_auto_code(db, prefix="ASI-NOM", year=entry_date.year)
+        entry = _build_posted_entry(
+            db,
+            code=entry_code,
+            entry_date=entry_date,
+            description=f"{_LABEL_PAYROLL} {code}",
+            reference_document=code,
+            created_by=created_by or "hr-payroll-approval",
+            items=items,
+        )
+        # _build_posted_entry valida sin añadir a la sesión para evitar un
+        # autoflush anticipado; el llamador lo registra dentro de su transacción.
+        db.add(entry)
+    if commit:
+        db.refresh(entry)
+    return AccountingResult(entry, None)
 
 
 # --------------------------------------------------------------------------- #
