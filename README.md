@@ -41,6 +41,7 @@ El desarrollo del sistema sigue la metodología **Spec-Driven Development (SDD)*
 * 💼 **Diagramas de Ventas y Facturación (`sales`):** Arquitectura y flujos del módulo de ventas y facturación. — [Ver diagramas](docs/sales_diagrams.md)
 * 🛒 **Diagrama de Compras y Proveedores (`purchasing`):** Arquitectura y flujos del módulo Compras. — [Ver diagramas](docs/purchasing_diagrams.md)
 * 📊 **Diagrama de Finanzas y Contabilidad (`accounting`):** Arquitectura y flujos del módulo Contabilidad. — [Ver diagramas](docs/accounting_diagrams.md)
+* 👥 **Diagrama de Recursos Humanos (`hr`):** Arquitectura y flujos del módulo Recursos Humanos. — [Ver diagramas](docs/hr_diagrams.md)
 
 
 ---
