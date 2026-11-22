@@ -1,8 +1,8 @@
 """Servicios de dominio del módulo de Recursos Humanos y Nómina.
 
 Implementa, para los Hitos 2 y 3 de ``specs/hr_spec.md``, la capa de servicio
-de empleados, contratos y asistencia (secciones 2.1, 2.2, 2.3, 3.1, 3.6, 4.1,
-4.2 y 4.3):
+de empleados, contratos, asistencia y nómina (secciones 2.1 a 2.5, 3.1 a 3.3,
+3.6, 4.1 a 4.4 y 5):
 
 * **Empleados:** alta con ``identification_number`` único (regla 6), listado
   filtrable por ``is_active``, perfil con historial laboral (contratos y
@@ -19,12 +19,33 @@ de empleados, contratos y asistencia (secciones 2.1, 2.2, 2.3, 3.1, 3.6, 4.1,
   periodo. Cada operación tiene una variante síncrona (``Session``) y otra
   asíncrona (``AsyncSession``) que comparten validación y construcción de la
   consulta.
+* **Nómina:** generación atómica de un ``PayrollRun`` en ``DRAFT`` a partir de
+  empleados activos con contrato activo vigente en el periodo (reglas 2, 3 y 6,
+  escenarios 1, 3, 5 y 6). Los importes se calculan solo con ``Decimal`` y se
+  cuantizan a 2 decimales con ``ROUND_HALF_UP``; los totales se suman desde los
+  desprendibles ya redondeados para que la agregación sea exacta.
+
+Las fórmulas adoptadas, necesarias porque la spec no fija tarifas, son:
+
+* ``base_salary`` del desprendible = salario mensual del contrato proporcional
+  al periodo: ``salario * min(días_del_periodo, 30) / 30``. Un periodo mensual
+  completo (28-31 días) paga el salario íntegro; uno quincenal paga la mitad.
+* ``overtime_pay`` = ``horas_extra_totales * salario_mensual / (30 * 8)``. La
+  tarifa por hora sale del salario mensual completo, no del proporcional.
+* ``bonuses`` y ``deductions`` no tienen fuente en la spec: el servicio acepta
+  importes explícitos por empleado y usa ``0.00`` cuando no se proporcionan.
+* ``earnings = base_salary + overtime_pay + bonuses`` y
+  ``net_pay = earnings - deductions``.
+
+Cualquier intento de recalcular o cambiar el estado de un periodo ``APPROVED``
+o ``PAID`` se rechaza con :class:`ImmutablePayrollRunError` (409); la corrección
+debe hacerse mediante una nueva nómina con ``is_adjustment=True`` (regla 3).
 
 Todas las escrituras usan :func:`_atomic` o :func:`_atomic_async`, que confirman
 al finalizar y revierten cualquier cambio ante un error de negocio o de
 integridad. Las excepciones derivan de ``fastapi.HTTPException`` con
-``status_code`` 400/404, por lo que son mapeables directamente por FastAPI sin
-un manejador adicional.
+``status_code`` 400/404/409, por lo que son mapeables directamente por FastAPI
+sin un manejador adicional.
 
 La exclusividad se comprueba en servicio y se serializa bloqueando la fila del
 empleado (``SELECT ... FOR UPDATE``) dentro de la transacción; el índice único
@@ -34,46 +55,68 @@ por carrera entre peticiones concurrentes.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
-from datetime import date as date_type
-from decimal import Decimal, InvalidOperation
+from datetime import date as date_type, datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql import Select
 
-from src.modules.hr.models import Attendance, AttendanceStatus, Contract, Employee
+from src.modules.hr.models import (
+    Attendance,
+    AttendanceStatus,
+    Contract,
+    Employee,
+    PayrollRun,
+    PayrollRunStatus,
+    Payslip,
+)
 from src.modules.hr.schemas import (
     AttendanceCreate,
     ContractCreate,
     EmployeeCreate,
     EmployeeResponse,
     EmployeeUpdate,
+    PayrollRunCreate,
+    PayrollRunDetailResponse,
+    PayrollRunResponse,
 )
 
 __all__ = [
     "ActiveContractError",
     "DuplicateIdentificationError",
+    "DuplicatePayrollCodeError",
     "HRServiceError",
+    "ImmutablePayrollRunError",
     "InvalidAttendanceError",
     "InvalidEmployeeDataError",
+    "InvalidPayrollDataError",
     "ResourceNotFoundError",
+    "approve_payroll_run",
     "create_attendance",
     "create_attendance_async",
     "create_contract",
     "create_employee",
+    "create_payroll_run",
     "get_active_contract",
     "get_contract",
     "get_employee",
     "get_employee_profile",
+    "get_payroll_run",
+    "get_payroll_run_detail",
+    "get_payroll_run_summary",
     "list_attendance",
     "list_attendance_async",
     "list_contracts_by_employee",
     "list_employees",
+    "list_payroll_runs",
+    "recalculate_payroll_run",
+    "set_payroll_run_status",
     "update_employee",
 ]
 
@@ -124,6 +167,53 @@ class InvalidAttendanceError(HRServiceError):
     """La novedad de asistencia no cumple la spec (estado, horas o rango)."""
 
     status_code = 400
+
+
+class DuplicatePayrollCodeError(HRServiceError):
+    """El ``code`` del periodo de nómina ya existe (regla 6, escenario 5)."""
+
+    status_code = 400
+
+
+class InvalidPayrollDataError(HRServiceError):
+    """Periodo, importes o parámetros de cálculo de nómina no válidos."""
+
+    status_code = 400
+
+
+class ImmutablePayrollRunError(HRServiceError):
+    """El periodo aprobado/pagado no se puede modificar (regla 3, escenario 3)."""
+
+    status_code = 409
+
+
+# --------------------------------------------------------------------------- #
+# Constantes de cálculo de nómina
+# --------------------------------------------------------------------------- #
+
+#: Unidad mínima de los importes monetarios del ERP.
+_CENT = Decimal("0.01")
+
+#: Límite de ``Numeric(14, 2)`` expresado como ``Decimal``.
+_MAX_MONEY = Decimal("999999999999.99")
+
+#: Base de prorrateo mensual y jornada diaria usadas por la spec implícita.
+_DAYS_IN_MONTH = Decimal("30")
+_HOURS_PER_DAY = Decimal("8")
+
+#: Horas extra máximas que caben en ``Numeric(7, 2)``.
+_MAX_HOURS = Decimal("99999.99")
+
+#: Importe neutro para bonificaciones/deducciones no informadas.
+_ZERO_MONEY = Decimal("0.00")
+
+#: Estados que todavía permiten recalcular o transicionar un periodo.
+_MUTABLE_PAYROLL_STATUSES = frozenset({PayrollRunStatus.DRAFT})
+
+#: Estados a los que puede transicionar un periodo libre de la API de servicio.
+_ALLOWED_PAYROLL_TARGET_STATUSES = frozenset(
+    {PayrollRunStatus.APPROVED, PayrollRunStatus.PAID}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -272,6 +362,263 @@ def _raise_duplicate_identification(identification: str, exc: IntegrityError) ->
     raise DuplicateIdentificationError(
         f"Ya existe un empleado con el número de identificación '{identification}'"
     ) from exc
+
+
+# --------------------------------------------------------------------------- #
+# Utilidades de nómina — /api/v1/hr/payrolls
+# --------------------------------------------------------------------------- #
+
+
+def _as_decimal(value: object, *, field: str, maximum: Decimal) -> Decimal:
+    """Convierte a ``Decimal`` sin pasar por ``float`` y valida el rango.
+
+    Se rechazan explícitamente ``float`` y ``bool`` para que ningún importe o
+    hora entre en el cálculo con pérdida de precisión binaria.
+    """
+    if isinstance(value, (float, bool)) or value is None:
+        raise InvalidPayrollDataError(
+            f"{field} debe ser Decimal, entero o cadena, nunca float"
+        )
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise InvalidPayrollDataError(f"{field} no es un valor decimal válido") from exc
+    if not amount.is_finite():
+        raise InvalidPayrollDataError(f"{field} debe ser finito")
+    if amount < 0 or amount > maximum:
+        raise InvalidPayrollDataError(
+            f"{field} debe estar entre 0 y {maximum}"
+        )
+    return amount
+
+
+def _quantize_money(value: Decimal) -> Decimal:
+    """Redondea importes a céntanos con ``ROUND_HALF_UP``."""
+    return value.quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+def _ensure_payroll_period(data: PayrollRunCreate) -> None:
+    """Revalida el periodo y el código aunque se haya sorteado Pydantic."""
+    if not isinstance(data.code, str) or not data.code.strip():
+        raise InvalidPayrollDataError("code no puede estar vacío")
+    if len(data.code) > 30:
+        raise InvalidPayrollDataError("code no puede superar 30 caracteres")
+    if not isinstance(data.period_start, date_type) or not isinstance(
+        data.period_end, date_type
+    ):
+        raise InvalidPayrollDataError(
+            "period_start y period_end deben ser fechas"
+        )
+    if data.period_start > data.period_end:
+        raise InvalidPayrollDataError(
+            "period_start no puede ser posterior a period_end"
+        )
+    if not isinstance(data.is_adjustment, bool):
+        raise InvalidPayrollDataError("is_adjustment debe ser booleano")
+
+
+def _amount_from(
+    mapping: Mapping[int, object] | None,
+    employee_id: int,
+    fallback: Decimal,
+    field: str,
+) -> Decimal:
+    """Resuelve un importe por empleado, usando ``fallback`` si no se informa."""
+    if mapping is None or employee_id not in mapping:
+        return fallback
+    return _quantize_money(
+        _as_decimal(
+            mapping[employee_id],
+            field=f"{field}[{employee_id}]",
+            maximum=_MAX_MONEY,
+        )
+    )
+
+
+def _ensure_unique_payroll_code(
+    db: Session, code: str, *, exclude_id: int | None = None
+) -> None:
+    """Verifica que el código de periodo no pertenezca a otro ``PayrollRun``."""
+    stmt = select(PayrollRun.id).where(PayrollRun.code == code)
+    if exclude_id is not None:
+        stmt = stmt.where(PayrollRun.id != exclude_id)
+    if db.execute(stmt.limit(1)).first() is not None:
+        raise DuplicatePayrollCodeError(
+            f"Ya existe un periodo de nómina con el código '{code}'"
+        )
+
+
+def _get_payroll_run_row(
+    db: Session,
+    payroll_run_id: int,
+    *,
+    for_update: bool = False,
+    with_payslips: bool = False,
+) -> PayrollRun:
+    """Obtiene un periodo de nómina o lanza ``ResourceNotFoundError``."""
+    stmt = select(PayrollRun).where(PayrollRun.id == payroll_run_id)
+    if with_payslips:
+        stmt = stmt.options(selectinload(PayrollRun.payslips))
+    if for_update:
+        stmt = stmt.with_for_update()
+    payroll_run = db.scalars(stmt).first()
+    if payroll_run is None:
+        raise ResourceNotFoundError(
+            f"Periodo de nómina {payroll_run_id} no encontrado"
+        )
+    return payroll_run
+
+
+def _ensure_payroll_mutable(payroll_run: PayrollRun) -> None:
+    """Bloquea la mutación de periodos aprobados o pagados (regla 3)."""
+    try:
+        status = PayrollRunStatus(payroll_run.status)
+    except (TypeError, ValueError) as exc:
+        raise InvalidPayrollDataError(
+            f"Estado de nómina no válido: {payroll_run.status!r}"
+        ) from exc
+    if status not in _MUTABLE_PAYROLL_STATUSES:
+        raise ImmutablePayrollRunError(
+            f"El periodo de nómina '{payroll_run.code}' está {status.value} y es "
+            "inmutable; cree una nómina de ajuste (is_adjustment=True) para "
+            "corregirlo"
+        )
+
+
+def _eligible_payroll_employees(
+    db: Session, period_start: date_type, period_end: date_type
+) -> list[tuple[Employee, Contract]]:
+    """Empleados activos con contrato activo vigente en el periodo (escenario 6)."""
+    stmt = (
+        select(Employee, Contract)
+        .join(Contract, Contract.employee_id == Employee.id)
+        .where(
+            Employee.is_active.is_(True),
+            Contract.is_active.is_(True),
+            Contract.start_date <= period_end,
+            or_(
+                Contract.end_date.is_(None),
+                Contract.end_date >= period_start,
+            ),
+        )
+        .order_by(Employee.id, Contract.id)
+    )
+    return list(db.execute(stmt).all())
+
+
+def _overtime_hours_by_employee(
+    db: Session,
+    employee_ids: list[int],
+    period_start: date_type,
+    period_end: date_type,
+) -> dict[int, Decimal]:
+    """Suma las horas extra de asistencia del periodo sin usar ``float``."""
+    totals = {employee_id: Decimal("0") for employee_id in employee_ids}
+    if not employee_ids:
+        return totals
+    stmt = (
+        select(Attendance)
+        .where(
+            Attendance.employee_id.in_(employee_ids),
+            Attendance.date >= period_start,
+            Attendance.date <= period_end,
+        )
+        .order_by(Attendance.employee_id, Attendance.date, Attendance.id)
+    )
+    for record in db.scalars(stmt).all():
+        hours = _as_decimal(
+            record.overtime_hours,
+            field=f"overtime_hours[{record.employee_id}]",
+            maximum=_MAX_HOURS,
+        )
+        totals[record.employee_id] = totals[record.employee_id] + hours
+    return totals
+
+
+def _build_payslips(
+    db: Session,
+    payroll_run: PayrollRun,
+    *,
+    period_start: date_type,
+    period_end: date_type,
+    bonuses: Mapping[int, object] | None,
+    deductions: Mapping[int, object] | None,
+    previous: Mapping[int, Payslip] | None = None,
+) -> list[Payslip]:
+    """Calcula y persiste los desprendibles del periodo con ``Decimal`` exacto."""
+    eligible = _eligible_payroll_employees(db, period_start, period_end)
+    if not eligible:
+        return []
+
+    overtime_hours = _overtime_hours_by_employee(
+        db,
+        [employee.id for employee, _ in eligible],
+        period_start,
+        period_end,
+    )
+    days_in_period = (period_end - period_start).days + 1
+    proration = Decimal(min(days_in_period, 30)) / _DAYS_IN_MONTH
+    hourly_divisor = _DAYS_IN_MONTH * _HOURS_PER_DAY
+
+    payslips: list[Payslip] = []
+    for employee, contract in eligible:
+        monthly_salary = _as_decimal(
+            contract.base_salary,
+            field=f"base_salary[{employee.id}]",
+            maximum=_MAX_MONEY,
+        )
+        base_salary = _quantize_money(monthly_salary * proration)
+        overtime_pay = _quantize_money(
+            overtime_hours[employee.id] * monthly_salary / hourly_divisor
+        )
+        old = previous.get(employee.id) if previous is not None else None
+        bonus = _amount_from(
+            bonuses,
+            employee.id,
+            old.bonuses if old is not None else _ZERO_MONEY,
+            "bonuses",
+        )
+        deduction = _amount_from(
+            deductions,
+            employee.id,
+            old.deductions if old is not None else _ZERO_MONEY,
+            "deductions",
+        )
+        earnings = _quantize_money(base_salary + overtime_pay + bonus)
+        net_pay = _quantize_money(earnings - deduction)
+        if net_pay < 0:
+            raise InvalidPayrollDataError(
+                f"Las deducciones superan los devengos del empleado {employee.id}"
+            )
+
+        payslip = Payslip(
+            payroll_run_id=payroll_run.id,
+            employee_id=employee.id,
+            base_salary=base_salary,
+            overtime_pay=overtime_pay,
+            bonuses=bonus,
+            deductions=deduction,
+            earnings=earnings,
+            net_pay=net_pay,
+        )
+        db.add(payslip)
+        payslips.append(payslip)
+    return payslips
+
+
+def _set_payroll_totals(
+    payroll_run: PayrollRun, payslips: list[Payslip]
+) -> None:
+    """Consolida totales exactos sumando los importes ya cuantizados."""
+    payroll_run.total_earnings = _quantize_money(
+        sum((item.earnings for item in payslips), _ZERO_MONEY)
+    )
+    payroll_run.total_deductions = _quantize_money(
+        sum((item.deductions for item in payslips), _ZERO_MONEY)
+    )
+    payroll_run.total_net = _quantize_money(
+        sum((item.net_pay for item in payslips), _ZERO_MONEY)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -503,3 +850,173 @@ async def list_attendance_async(
     stmt = stmt.offset(skip).limit(limit)
     result = await db.scalars(stmt)
     return list(result.all())
+
+
+# --------------------------------------------------------------------------- #
+# Nómina — /api/v1/hr/payrolls
+# --------------------------------------------------------------------------- #
+
+
+def create_payroll_run(
+    db: Session,
+    data: PayrollRunCreate,
+    *,
+    bonuses: Mapping[int, object] | None = None,
+    deductions: Mapping[int, object] | None = None,
+) -> PayrollRun:
+    """Genera un periodo en ``DRAFT`` con sus desprendibles calculados.
+
+    El código único se comprueba antes de insertar y el índice único es la
+    última barrera; cualquier ``IntegrityError`` se traduce a
+    :class:`DuplicatePayrollCodeError` (400, escenario 5). Empleados inactivos,
+    sin contrato activo o con un contrato que no cubre el periodo se excluyen
+    (escenario 6). ``bonuses`` y ``deductions`` son importes opcionales por
+    ``employee_id``; la spec no define una fuente de datos para ellos.
+    """
+    _ensure_payroll_period(data)
+    try:
+        with _atomic(db):
+            _ensure_unique_payroll_code(db, data.code)
+            payroll_run = PayrollRun(
+                code=data.code,
+                period_start=data.period_start,
+                period_end=data.period_end,
+                status=PayrollRunStatus.DRAFT,
+                is_adjustment=data.is_adjustment,
+                total_earnings=_ZERO_MONEY,
+                total_deductions=_ZERO_MONEY,
+                total_net=_ZERO_MONEY,
+                approved_at=None,
+            )
+            db.add(payroll_run)
+            db.flush()
+
+            payslips = _build_payslips(
+                db,
+                payroll_run,
+                period_start=data.period_start,
+                period_end=data.period_end,
+                bonuses=bonuses,
+                deductions=deductions,
+            )
+            _set_payroll_totals(payroll_run, payslips)
+    except IntegrityError as exc:
+        raise DuplicatePayrollCodeError(
+            f"Ya existe un periodo de nómina con el código '{data.code}'"
+        ) from exc
+
+    db.refresh(payroll_run)
+    return payroll_run
+
+
+def get_payroll_run(db: Session, payroll_run_id: int) -> PayrollRun:
+    """Obtiene un periodo de nómina con todos sus desprendibles."""
+    return _get_payroll_run_row(db, payroll_run_id, with_payslips=True)
+
+
+def get_payroll_run_summary(
+    db: Session, payroll_run_id: int
+) -> PayrollRunResponse:
+    """Devuelve el periodo sin la colección de desprendibles."""
+    return PayrollRunResponse.model_validate(
+        _get_payroll_run_row(db, payroll_run_id)
+    )
+
+
+def get_payroll_run_detail(
+    db: Session, payroll_run_id: int
+) -> PayrollRunDetailResponse:
+    """Devuelve el detalle del periodo y sus ``Payslip`` ya calculados."""
+    return PayrollRunDetailResponse.model_validate(get_payroll_run(db, payroll_run_id))
+
+
+def list_payroll_runs(
+    db: Session,
+    *,
+    status: PayrollRunStatus | None = None,
+    is_adjustment: bool | None = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[PayrollRun]:
+    """Lista periodos históricos filtrando por estado y tipo de ajuste."""
+    stmt = select(PayrollRun)
+    if status is not None:
+        stmt = stmt.where(PayrollRun.status == status)
+    if is_adjustment is not None:
+        stmt = stmt.where(PayrollRun.is_adjustment.is_(is_adjustment))
+    stmt = stmt.order_by(PayrollRun.period_start, PayrollRun.id)
+    stmt = stmt.offset(skip).limit(limit)
+    return list(db.scalars(stmt).all())
+
+
+def recalculate_payroll_run(
+    db: Session,
+    payroll_run_id: int,
+    *,
+    bonuses: Mapping[int, object] | None = None,
+    deductions: Mapping[int, object] | None = None,
+) -> PayrollRun:
+    """Recalcula desprendibles y totales de un periodo en ``DRAFT``.
+
+    Los importes de bonificación/deducción no informados se conservan de los
+    desprendibles anteriores. En ``APPROVED``/``PAID`` la operación se rechaza
+    con :class:`ImmutablePayrollRunError` (409) y no se escribe nada.
+    """
+    with _atomic(db):
+        payroll_run = _get_payroll_run_row(
+            db, payroll_run_id, for_update=True, with_payslips=True
+        )
+        _ensure_payroll_mutable(payroll_run)
+        previous = {item.employee_id: item for item in payroll_run.payslips}
+        payroll_run.payslips.clear()
+        db.flush()
+
+        payslips = _build_payslips(
+            db,
+            payroll_run,
+            period_start=payroll_run.period_start,
+            period_end=payroll_run.period_end,
+            bonuses=bonuses,
+            deductions=deductions,
+            previous=previous,
+        )
+        _set_payroll_totals(payroll_run, payslips)
+
+    db.refresh(payroll_run)
+    return payroll_run
+
+
+def set_payroll_run_status(
+    db: Session, payroll_run_id: int, status: PayrollRunStatus
+) -> PayrollRun:
+    """Transiciona un periodo ``DRAFT`` a ``APPROVED`` o ``PAID``.
+
+    La aprobación queda registrada en ``approved_at``. Un periodo ya aprobado
+    o pagado no puede cambiar de estado: la corrección exige una nueva nómina
+    de ajuste (regla 3, escenario 3).
+    """
+    try:
+        target = PayrollRunStatus(status)
+    except (TypeError, ValueError) as exc:
+        raise InvalidPayrollDataError(
+            f"Estado de nómina no válido: {status!r}"
+        ) from exc
+    if target not in _ALLOWED_PAYROLL_TARGET_STATUSES:
+        raise InvalidPayrollDataError(
+            "Desde DRAFT solo se puede transicionar a APPROVED o PAID"
+        )
+
+    with _atomic(db):
+        payroll_run = _get_payroll_run_row(db, payroll_run_id, for_update=True)
+        _ensure_payroll_mutable(payroll_run)
+        payroll_run.status = target
+        if target is PayrollRunStatus.APPROVED:
+            payroll_run.approved_at = datetime.now(timezone.utc)
+
+    db.refresh(payroll_run)
+    return payroll_run
+
+
+def approve_payroll_run(db: Session, payroll_run_id: int) -> PayrollRun:
+    """Aprueba un periodo en borrador (sin contabilizar; escenario 4 aparte)."""
+    return set_payroll_run_status(db, payroll_run_id, PayrollRunStatus.APPROVED)
