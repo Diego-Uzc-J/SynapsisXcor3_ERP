@@ -1157,11 +1157,14 @@ def list_production_orders(
     *,
     status: ProductionOrderStatus | str | None = None,
     bom_id: int | None = None,
+    created_date: date | None = None,
     skip: int = 0,
     limit: int = 100,
 ) -> list[ProductionOrder]:
-    """Lista OPs con filtros opcionales por estado y BOM (spec §4.3)."""
+    """Lista OPs con filtros opcionales por estado, BOM y fecha (spec §4.3)."""
     stmt = select(ProductionOrder)
+    if created_date is not None:
+        stmt = stmt.where(func.date(ProductionOrder.created_at) == created_date)
     if status is not None:
         try:
             status = ProductionOrderStatus(status)
