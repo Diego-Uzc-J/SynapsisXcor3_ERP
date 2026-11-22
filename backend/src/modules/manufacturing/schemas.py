@@ -60,6 +60,7 @@ __all__ = [
     "ProductionOrderResponse",
     "ProductionOrderStart",
     "ProductionOrderStatus",
+    "ProductionOrderUpdate",
     "StrictDecimal",
     "StrictHours",
     "StrictMoney",
@@ -361,6 +362,42 @@ class ProductionOrderCreate(ManufacturingSchema):
     @model_validator(mode="after")
     def _validate_warehouses(self) -> Self:
         if self.warehouse_source_id == self.warehouse_destination_id:
+            raise ValueError(
+                "La bodega de origen y la de destino deben ser distintas"
+            )
+        return self
+
+
+class ProductionOrderUpdate(ManufacturingSchema):
+    """Actualización parcial de una OP en estado ``PLANNED`` o ``IN_PROGRESS``.
+
+    Solo se pueden editar campos de planificación. ``code``, ``bom_id``,
+    ``status``, lo producido, las fechas de transición y los costes son
+    inmutables: los fija el servicio o se alcanzan mediante transiciones.
+    ``work_center_id`` sí admite ``null`` explícito para dejar la orden sin
+    estación asignada. El servicio comprueba además que la orden no esté
+    ``COMPLETED``/``CANCELLED`` (regla 4) y que los almacenes efectivos sean
+    distintos.
+    """
+
+    quantity_to_produce: StrictQuantity | None = Field(default=None, gt=0)
+    estimated_hours: StrictHours | None = Field(default=None, ge=0)
+    work_center_id: int | None = Field(default=None, gt=0)
+    warehouse_source_id: int | None = Field(default=None, gt=0)
+    warehouse_destination_id: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_patch(self) -> Self:
+        if not self.model_fields_set:
+            raise ValueError("Debe enviar al menos un campo para actualizar")
+        for field in self.model_fields_set:
+            if field != "work_center_id" and getattr(self, field) is None:
+                raise ValueError(f"El campo '{field}' no puede ser nulo")
+        if (
+            self.warehouse_source_id is not None
+            and self.warehouse_destination_id is not None
+            and self.warehouse_source_id == self.warehouse_destination_id
+        ):
             raise ValueError(
                 "La bodega de origen y la de destino deben ser distintas"
             )

@@ -1,4 +1,4 @@
-"""Pruebas unitarias de los servicios de centros de trabajo y BOM.
+"""Pruebas unitarias de los servicios de manufactura.
 
 Cubren las reglas implementadas en ``manufacturing.services`` derivadas de
 ``specs/manufacturing_spec.md``:
@@ -9,7 +9,12 @@ Cubren las reglas implementadas en ``manufacturing.services`` derivadas de
 * conflicto de ``code`` duplicado y de BOM activa por ``product_id``/``version``
   (regla 5 y escenario 4), permitiendo BOM inactivas duplicadas;
 * desactivación y activación controlada de versiones;
-* reemplazo de componentes mediante PATCH y atomicidad de los rechazos.
+* reemplazo de componentes mediante PATCH y atomicidad de los rechazos;
+* alta de OP en ``PLANNED`` con BOM activa y con componentes, bodegas existentes
+  y cantidad positiva (reglas 5 y 6, escenario 6);
+* detalle y listado de OPs con filtros por ``status``/``bom_id``;
+* inmutabilidad de OPs ``COMPLETED``/``CANCELLED`` (regla 4, escenario 3) y
+  cancelación desde ``PLANNED``.
 
 Se usa SQLite en memoria, igual que el resto de la suite de servicios.
 """
@@ -18,11 +23,13 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine, delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -34,31 +41,44 @@ if str(BACKEND_ROOT) not in sys.path:
 os.environ.setdefault("DATABASE_URL", "sqlite://")
 
 from src.core.database import Base  # noqa: E402
-from src.modules.inventory.models import Product  # noqa: E402
+from src.modules.inventory.models import Product, Warehouse  # noqa: E402
 from src.modules.manufacturing.models import (  # noqa: E402
     BOMItem,
     BillOfMaterials,
+    ProductionOrder,
+    ProductionOrderStatus,
     WorkCenter,
 )
 from src.modules.manufacturing.schemas import (  # noqa: E402
     BOMCreate,
     BOMUpdate,
+    ProductionOrderCreate,
+    ProductionOrderUpdate,
     WorkCenterCreate,
     WorkCenterUpdate,
 )
 from src.modules.manufacturing.services import (  # noqa: E402
     DuplicateResourceError,
+    ImmutableProductionOrderError,
+    InactiveBOMError,
     InactiveProductError,
     InvalidBOMError,
+    InvalidProductionOrderError,
     ResourceNotFoundError,
     activate_bom,
+    cancel_production_order,
     create_bom,
+    create_production_order,
     create_work_center,
     deactivate_bom,
+    ensure_production_order_mutable,
     get_bom,
+    get_production_order,
     list_boms,
+    list_production_orders,
     list_work_centers,
     update_bom,
+    update_production_order,
     update_work_center,
 )
 
@@ -100,6 +120,9 @@ def db_session() -> Session:
                     unit_price=Decimal("1.00"),
                     is_active=False,
                 ),
+                Warehouse(code="WHS-INSUMOS", name="Bodega de insumos"),
+                Warehouse(code="WHS-PT", name="Bodega de producto terminado"),
+                Warehouse(code="WHS-EXTRA", name="Bodega auxiliar"),
             ]
         )
         session.commit()
@@ -155,6 +178,23 @@ def bom_payload(
             for pid in component_ids
         ],
     )
+
+
+def warehouse_id(db: Session, code: str) -> int:
+    """Devuelve el id de una bodega sembrada en la fixture."""
+    return int(db.scalars(select(Warehouse.id).where(Warehouse.code == code)).one())
+
+
+def order_payload(db: Session, **overrides: Any) -> ProductionOrderCreate:
+    """OP válida; el llamador indica siempre el ``bom_id`` a referenciar."""
+    values: dict[str, Any] = {
+        "warehouse_source_id": warehouse_id(db, "WHS-INSUMOS"),
+        "warehouse_destination_id": warehouse_id(db, "WHS-PT"),
+        "quantity_to_produce": Decimal("10.00"),
+        "estimated_hours": Decimal("0.00"),
+    }
+    values.update(overrides)
+    return ProductionOrderCreate(**values)
 
 
 # --------------------------------------------------------------------------- #
@@ -370,3 +410,287 @@ def test_activate_bom_validates_product_and_components(db_session: Session) -> N
     with pytest.raises(InvalidBOMError, match="al menos un componente"):
         activate_bom(db_session, bom.id)
     assert get_bom(db_session, bom.id).is_active is False
+
+
+# --------------------------------------------------------------------------- #
+# Órdenes de producción
+# --------------------------------------------------------------------------- #
+
+
+def test_create_production_order_starts_planned(db_session: Session) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+
+    assert order.id is not None
+    assert order.status is ProductionOrderStatus.PLANNED
+    assert order.code.startswith(f"OP-{datetime.now(timezone.utc).year}-")
+    assert order.quantity_to_produce == Decimal("10.00")
+    assert order.quantity_produced == Decimal("0.00")
+    assert order.estimated_hours == Decimal("0.00")
+    assert order.actual_hours == Decimal("0.00")
+    assert order.unit_production_cost is None
+    assert count(db_session, ProductionOrder) == 1
+
+
+def test_create_production_order_rejects_inactive_bom(db_session: Session) -> None:
+    bom = create_bom(db_session, bom_payload(db_session, is_active=False))
+
+    with pytest.raises(InactiveBOMError, match="inactiva"):
+        create_production_order(db_session, order_payload(db_session, bom_id=bom.id))
+
+    assert count(db_session, ProductionOrder) == 0
+
+
+def test_create_production_order_rejects_bom_without_items(
+    db_session: Session,
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    db_session.execute(delete(BOMItem).where(BOMItem.bom_id == bom.id))
+    db_session.commit()
+
+    with pytest.raises(InvalidBOMError, match="componentes"):
+        create_production_order(db_session, order_payload(db_session, bom_id=bom.id))
+
+    assert count(db_session, ProductionOrder) == 0
+
+
+@pytest.mark.parametrize("quantity", ["0", "-1"])
+def test_create_production_order_rejects_non_positive_quantity(
+    db_session: Session, quantity: str
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    # ``model_construct`` evita el validador de Pydantic para comprobar que la
+    # regla también se aplica en la capa de servicio.
+    payload = ProductionOrderCreate.model_construct(
+        bom_id=bom.id,
+        warehouse_source_id=warehouse_id(db_session, "WHS-INSUMOS"),
+        warehouse_destination_id=warehouse_id(db_session, "WHS-PT"),
+        quantity_to_produce=Decimal(quantity),
+        estimated_hours=Decimal("0.00"),
+        code=None,
+        work_center_id=None,
+    )
+
+    with pytest.raises(InvalidProductionOrderError, match="mayor que cero"):
+        create_production_order(db_session, payload)
+
+    assert count(db_session, ProductionOrder) == 0
+
+
+def test_create_production_order_rejects_unknown_references(
+    db_session: Session,
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+
+    with pytest.raises(ResourceNotFoundError, match="BOM 9999"):
+        create_production_order(db_session, order_payload(db_session, bom_id=9999))
+
+    with pytest.raises(ResourceNotFoundError, match="Almacén 9999"):
+        create_production_order(
+            db_session,
+            order_payload(db_session, bom_id=bom.id, warehouse_source_id=9999),
+        )
+
+    with pytest.raises(ResourceNotFoundError, match="Almacén 9998"):
+        create_production_order(
+            db_session,
+            order_payload(db_session, bom_id=bom.id, warehouse_destination_id=9998),
+        )
+
+    with pytest.raises(ResourceNotFoundError, match="Centro de trabajo 9997"):
+        create_production_order(
+            db_session,
+            order_payload(db_session, bom_id=bom.id, work_center_id=9997),
+        )
+
+    same_warehouse = warehouse_id(db_session, "WHS-INSUMOS")
+    payload = ProductionOrderCreate.model_construct(
+        bom_id=bom.id,
+        warehouse_source_id=same_warehouse,
+        warehouse_destination_id=same_warehouse,
+        quantity_to_produce=Decimal("10.00"),
+        estimated_hours=Decimal("0.00"),
+        code=None,
+        work_center_id=None,
+    )
+    with pytest.raises(InvalidProductionOrderError, match="distintas"):
+        create_production_order(db_session, payload)
+
+    assert count(db_session, ProductionOrder) == 0
+
+
+def test_create_production_order_rejects_duplicate_code(db_session: Session) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    first = create_production_order(
+        db_session,
+        order_payload(db_session, bom_id=bom.id, code="OP-2026-0001"),
+    )
+
+    with pytest.raises(DuplicateResourceError, match="OP-2026-0001"):
+        create_production_order(
+            db_session,
+            order_payload(db_session, bom_id=bom.id, code=first.code),
+        )
+
+    assert count(db_session, ProductionOrder) == 1
+
+
+def test_get_and_list_production_orders(db_session: Session) -> None:
+    first_bom = create_bom(db_session, bom_payload(db_session, code="BOM-OP-1"))
+    second_bom = create_bom(
+        db_session,
+        bom_payload(db_session, code="BOM-OP-2", version=2),
+    )
+    work_center = create_work_center(db_session, work_center_payload())
+    first = create_production_order(
+        db_session,
+        order_payload(db_session, bom_id=first_bom.id, work_center_id=work_center.id),
+    )
+    second = create_production_order(
+        db_session,
+        order_payload(db_session, bom_id=second_bom.id, code="OP-2026-0002"),
+    )
+
+    detail = get_production_order(db_session, first.id)
+    assert detail.bom.id == first_bom.id
+    assert len(detail.bom.items) == 2
+    assert detail.work_center is not None
+    assert detail.work_center.id == work_center.id
+    assert detail.warehouse_source.code == "WHS-INSUMOS"
+    assert detail.warehouse_destination.code == "WHS-PT"
+
+    assert [order.id for order in list_production_orders(db_session)] == [
+        first.id,
+        second.id,
+    ]
+    assert [
+        order.id for order in list_production_orders(db_session, bom_id=second_bom.id)
+    ] == [second.id]
+    assert [
+        order.id
+        for order in list_production_orders(
+            db_session, status=ProductionOrderStatus.PLANNED
+        )
+    ] == [first.id, second.id]
+    assert list_production_orders(db_session, status="COMPLETED") == []
+    assert list_production_orders(db_session, skip=1, limit=1)[0].id == second.id
+
+    with pytest.raises(InvalidProductionOrderError, match="no válido"):
+        list_production_orders(db_session, status="EN_CURSO")
+    with pytest.raises(ResourceNotFoundError, match="9999"):
+        get_production_order(db_session, 9999)
+
+
+def test_update_production_order_validates_plan_changes(db_session: Session) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    work_center = create_work_center(db_session, work_center_payload())
+    order = create_production_order(
+        db_session,
+        order_payload(db_session, bom_id=bom.id, work_center_id=work_center.id),
+    )
+
+    updated = update_production_order(
+        db_session,
+        order.id,
+        ProductionOrderUpdate(
+            quantity_to_produce=Decimal("20.00"),
+            estimated_hours=Decimal("3.50"),
+            work_center_id=None,
+        ),
+    )
+    assert updated.quantity_to_produce == Decimal("20.00")
+    assert updated.estimated_hours == Decimal("3.50")
+    assert updated.work_center_id is None
+
+    with pytest.raises(InvalidProductionOrderError, match="distintas"):
+        update_production_order(
+            db_session,
+            order.id,
+            ProductionOrderUpdate(
+                warehouse_source_id=order.warehouse_destination_id
+            ),
+        )
+    with pytest.raises(ResourceNotFoundError, match="Almacén 9999"):
+        update_production_order(
+            db_session,
+            order.id,
+            ProductionOrderUpdate(warehouse_destination_id=9999),
+        )
+    with pytest.raises(ResourceNotFoundError, match="Centro de trabajo 9997"):
+        update_production_order(
+            db_session,
+            order.id,
+            ProductionOrderUpdate(work_center_id=9997),
+        )
+
+    with pytest.raises(ValidationError):
+        ProductionOrderUpdate(code="OP-OTRO")
+    with pytest.raises(ValidationError):
+        ProductionOrderUpdate(status=ProductionOrderStatus.CANCELLED)
+    assert get_production_order(db_session, order.id).code == order.code
+
+
+@pytest.mark.parametrize(
+    "status", [ProductionOrderStatus.COMPLETED, ProductionOrderStatus.CANCELLED]
+)
+def test_closed_orders_are_immutable(
+    db_session: Session, status: ProductionOrderStatus
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    order.status = status
+    db_session.commit()
+
+    with pytest.raises(ImmutableProductionOrderError, match="inmutable"):
+        update_production_order(
+            db_session,
+            order.id,
+            ProductionOrderUpdate(quantity_to_produce=Decimal("99.00")),
+        )
+    with pytest.raises(ImmutableProductionOrderError, match="inmutable"):
+        cancel_production_order(db_session, order.id)
+    with pytest.raises(ImmutableProductionOrderError, match="inmutable"):
+        ensure_production_order_mutable(db_session, order.id)
+
+    unchanged = get_production_order(db_session, order.id)
+    assert unchanged.status is status
+    assert unchanged.quantity_to_produce == Decimal("10.00")
+
+
+def test_cancel_production_order_from_planned(db_session: Session) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+
+    cancelled = cancel_production_order(db_session, order.id)
+
+    assert cancelled.status is ProductionOrderStatus.CANCELLED
+    assert get_production_order(db_session, order.id).status is (
+        ProductionOrderStatus.CANCELLED
+    )
+    with pytest.raises(ImmutableProductionOrderError, match="inmutable"):
+        cancel_production_order(db_session, order.id)
+
+
+def test_cancel_in_progress_order_requires_stock_reversal(
+    db_session: Session,
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    order.status = ProductionOrderStatus.IN_PROGRESS
+    db_session.commit()
+
+    with pytest.raises(InvalidProductionOrderError, match="revertir"):
+        cancel_production_order(db_session, order.id)
+
+    assert get_production_order(db_session, order.id).status is (
+        ProductionOrderStatus.IN_PROGRESS
+    )
