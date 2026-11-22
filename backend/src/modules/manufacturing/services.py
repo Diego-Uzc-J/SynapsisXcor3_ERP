@@ -18,6 +18,10 @@ inicial de órdenes de producción descrita en ``specs/manufacturing_spec.md``
   6); detalle con sus relaciones y listado filtrable por ``status``/``bom_id``;
   guardia de inmutabilidad para órdenes ``COMPLETED``/``CANCELLED`` (regla 4 y
   escenario 3) y cancelación desde ``PLANNED`` (regla 6).
+* **Inicio de producción:** ``PLANNED → IN_PROGRESS`` calcula los insumos de la
+  BOM con su merma y registra los ``OUTBOUND`` en ``inventory`` bajo el mismo
+  ``COMMIT`` que el cambio de estado (reglas 1 y 2, escenarios 1 y 2). Un
+  déficit de stock revierte todo el trabajo, sin descuentos parciales.
 
 Las validaciones que no requieren consultar estado ya viven en ``schemas.py``;
 aquí se comprueban las reglas que dependen de la base de datos. Las escrituras
@@ -36,16 +40,18 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
-from typing import Any, TypeVar
+from datetime import date, datetime, timezone
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from typing import Any, NamedTuple, TypeVar
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from src.modules.inventory.models import Product, Warehouse
+from src.modules.inventory import services as inventory_services
+from src.modules.inventory.models import MovementType, Product, Stock, Warehouse
+from src.modules.inventory.schemas import StockMovementCreate
 from src.modules.manufacturing.models import (
     BOMItem,
     BillOfMaterials,
@@ -58,6 +64,7 @@ from src.modules.manufacturing.schemas import (
     BOMItemCreate,
     BOMUpdate,
     ProductionOrderCreate,
+    ProductionOrderStart,
     ProductionOrderUpdate,
     WorkCenterCreate,
     WorkCenterUpdate,
@@ -68,6 +75,7 @@ __all__ = [
     "ImmutableProductionOrderError",
     "InactiveBOMError",
     "InactiveProductError",
+    "InsufficientComponentStockError",
     "InvalidBOMError",
     "InvalidProductionOrderError",
     "ManufacturingServiceError",
@@ -85,6 +93,7 @@ __all__ = [
     "list_boms",
     "list_production_orders",
     "list_work_centers",
+    "start_production_order",
     "update_bom",
     "update_production_order",
     "update_work_center",
@@ -158,6 +167,41 @@ class ImmutableProductionOrderError(ManufacturingServiceError):
     """La OP está ``COMPLETED``/``CANCELLED`` y no admite cambios (regla 4)."""
 
     status_code = 409
+
+
+class InsufficientComponentStockError(ManufacturingServiceError):
+    """Falta stock de un componente en la bodega de origen (regla 1, escenario 1).
+
+    Expone el desglose del déficit para que la API pueda responder con el
+    componente afectado, lo disponible y lo requerido, como exige la spec.
+    """
+
+    status_code = 400
+
+    def __init__(
+        self,
+        *,
+        product_id: int,
+        sku: str,
+        warehouse_id: int,
+        available: int,
+        required: int,
+        order_code: str | None = None,
+    ) -> None:
+        self.product_id = product_id
+        self.sku = sku
+        self.warehouse_id = warehouse_id
+        self.available = available
+        self.required = required
+        self.deficit = required - available
+        detail = (
+            f"Stock insuficiente del componente '{sku}' (producto {product_id}) "
+            f"en la bodega {warehouse_id}: disponible {available}, "
+            f"requerido {required}, déficit {self.deficit}"
+        )
+        if order_code is not None:
+            detail += f" para la orden '{order_code}'"
+        super().__init__(detail)
 
 
 # --------------------------------------------------------------------------- #
@@ -670,6 +714,149 @@ def _get_bom_for_order(db: Session, bom_id: int) -> BillOfMaterials:
     return bom
 
 
+class _ComponentRequirement(NamedTuple):
+    """Cantidad entera a consumir de un componente de la BOM."""
+
+    product_id: int
+    sku: str
+    quantity: int
+    scrap_percentage: Decimal
+
+
+def _calculate_requirements(
+    db: Session, bom: BillOfMaterials, quantity_to_produce: Decimal
+) -> list[_ComponentRequirement]:
+    """Calcula los insumos de la BOM para la cantidad objetivo (regla 1).
+
+    La merma se aplica por componente: ``cantidad_unitaria * (1 + merma/100) *
+    quantity_to_produce``. ``inventory`` maneja existencias enteras, así que el
+    resultado se redondea **por exceso** para no consumir menos de lo que la
+    receta exige (por ejemplo, 10.5 unidades → 11).
+    """
+    quantity = _ensure_positive_quantity(
+        quantity_to_produce, field="quantity_to_produce"
+    )
+    component_ids = [item.component_product_id for item in bom.items]
+    sku_by_id = dict(
+        db.execute(
+            select(Product.id, Product.sku).where(Product.id.in_(component_ids))
+        ).all()
+    )
+
+    requirements: list[_ComponentRequirement] = []
+    for item in bom.items:
+        sku = sku_by_id.get(item.component_product_id)
+        if sku is None:
+            raise ResourceNotFoundError(
+                f"Componente {item.component_product_id} de la BOM "
+                f"'{bom.code}' no encontrado en inventario"
+            )
+        scrap = item.scrap_percentage or Decimal("0.00")
+        raw_quantity = Decimal(item.quantity) * (
+            Decimal("1") + scrap / Decimal("100")
+        ) * quantity
+        required = int(raw_quantity.to_integral_value(rounding=ROUND_CEILING))
+        requirements.append(
+            _ComponentRequirement(
+                product_id=item.component_product_id,
+                sku=sku,
+                quantity=max(required, 1),
+                scrap_percentage=scrap,
+            )
+        )
+    return requirements
+
+
+def _stock_available(db: Session, product_id: int, warehouse_id: int) -> int:
+    """Devuelve el saldo disponible, cero si aún no hay fila de ``Stock``."""
+    available = db.scalar(
+        select(Stock.quantity).where(
+            Stock.product_id == product_id,
+            Stock.warehouse_id == warehouse_id,
+        )
+    )
+    return int(available or 0)
+
+
+def _prevalidate_stock(
+    db: Session,
+    requirements: list[_ComponentRequirement],
+    warehouse_id: int,
+    *,
+    order_code: str,
+) -> None:
+    """Detecta déficits antes de escribir, con el SKU en el mensaje (regla 1).
+
+    Es una comprobación temprana para dar un error legible; la validación
+    definitiva la hace ``inventory`` con bloqueo de fila al registrar cada
+    ``OUTBOUND``, de modo que una carrera entre dos órdenes no pueda dejar
+    existencias negativas.
+    """
+    for requirement in requirements:
+        available = _stock_available(db, requirement.product_id, warehouse_id)
+        if available < requirement.quantity:
+            raise InsufficientComponentStockError(
+                product_id=requirement.product_id,
+                sku=requirement.sku,
+                warehouse_id=warehouse_id,
+                available=available,
+                required=requirement.quantity,
+                order_code=order_code,
+            )
+
+
+def _register_outbound(
+    db: Session,
+    *,
+    requirement: _ComponentRequirement,
+    warehouse_id: int,
+    order_code: str,
+    created_by: str,
+) -> None:
+    """Registra el consumo de un componente dentro de la transacción de la OP.
+
+    ``commit=False`` y ``allow_negative_stock=False`` garantizan que el saldo y
+    el historial de ``inventory`` formen parte del único ``COMMIT`` de la OP y
+    que la configuración global no permita consumos negativos. Cualquier error
+    de ``inventory`` revierte la transacción completa antes de propagarse.
+    """
+    payload = StockMovementCreate(
+        product_id=requirement.product_id,
+        movement_type=MovementType.OUTBOUND,
+        warehouse_source_id=warehouse_id,
+        quantity=requirement.quantity,
+        reference_document=order_code,
+        notes=(
+            f"Consumo del componente {requirement.sku} para la orden "
+            f"{order_code}"
+        ),
+        created_by=created_by,
+    )
+    try:
+        inventory_services.create_stock_movement(
+            db,
+            payload,
+            allow_negative_stock=False,
+            commit=False,
+        )
+    except inventory_services.InsufficientStockError as exc:
+        raise InsufficientComponentStockError(
+            product_id=exc.product_id,
+            sku=requirement.sku,
+            warehouse_id=exc.warehouse_id,
+            available=exc.available,
+            required=exc.requested,
+            order_code=order_code,
+        ) from exc
+    except inventory_services.ResourceNotFoundError as exc:
+        raise ResourceNotFoundError(str(exc)) from exc
+    except inventory_services.InventoryError as exc:
+        raise InvalidProductionOrderError(
+            f"No se pudo registrar el consumo del componente "
+            f"'{requirement.sku}' para la orden '{order_code}': {exc}"
+        ) from exc
+
+
 def _ensure_unique_order_code(
     db: Session, code: str, *, exclude_id: int | None = None
 ) -> None:
@@ -907,6 +1094,61 @@ def update_production_order(
     return order
 
 
+def start_production_order(
+    db: Session,
+    order_id: int,
+    data: ProductionOrderStart | None = None,
+    *,
+    created_by: str = "manufacturing",
+) -> ProductionOrder:
+    """Inicia una OP ``PLANNED`` consumiendo sus componentes de forma atómica.
+
+    Bajo una única transacción (reglas 1, 2 y 6, escenarios 1 y 2):
+
+    1. bloquea la OP y rechaza estados ``COMPLETED``/``CANCELLED`` (409) y
+       ``IN_PROGRESS`` (400);
+    2. calcula los requerimientos de la BOM aplicando la merma de cada línea y
+       comprueba el stock de la bodega de origen;
+    3. registra un ``OUTBOUND`` por componente en ``inventory`` con
+       ``commit=False``;
+    4. marca la orden ``IN_PROGRESS`` y fija ``started_at``.
+
+    Un déficit de stock o cualquier error de ``inventory`` revierte los
+    movimientos ya registrados, el estado y la fecha: no queda descuento
+    parcial ni orden a medias.
+    """
+    started_at = data.started_at if data is not None and data.started_at else None
+    with _atomic(db):
+        order = ensure_production_order_mutable(db, order_id)
+        if order.status is not ProductionOrderStatus.PLANNED:
+            raise InvalidProductionOrderError(
+                f"La orden '{order.code}' debe estar PLANNED para iniciarse; "
+                f"estado actual: {order.status.value}"
+            )
+
+        bom = _get_bom_for_order(db, order.bom_id)
+        requirements = _calculate_requirements(db, bom, order.quantity_to_produce)
+        _prevalidate_stock(
+            db,
+            requirements,
+            order.warehouse_source_id,
+            order_code=order.code,
+        )
+        for requirement in requirements:
+            _register_outbound(
+                db,
+                requirement=requirement,
+                warehouse_id=order.warehouse_source_id,
+                order_code=order.code,
+                created_by=created_by,
+            )
+
+        order.status = ProductionOrderStatus.IN_PROGRESS
+        order.started_at = started_at or date.today()
+    db.refresh(order)
+    return order
+
+
 def ensure_production_order_mutable(
     db: Session, order_id: int
 ) -> ProductionOrder:
@@ -924,8 +1166,8 @@ def cancel_production_order(db: Session, order_id: int) -> ProductionOrder:
     """Cancela una OP ``PLANNED``; las cerradas se rechazan por inmutables.
 
     Cancelar desde ``IN_PROGRESS`` exigiría revertir los insumos ya descontados
-    en ``inventory`` (regla 6), integración que se implementa en el siguiente
-    hito junto con ``start``/``complete``.
+    por :func:`start_production_order` (regla 6); esa reversión no está
+    implementada, por lo que la transición se rechaza con 400.
     """
     with _atomic(db):
         order = ensure_production_order_mutable(db, order_id)

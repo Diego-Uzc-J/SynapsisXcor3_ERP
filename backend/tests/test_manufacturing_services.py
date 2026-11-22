@@ -14,7 +14,10 @@ Cubren las reglas implementadas en ``manufacturing.services`` derivadas de
   y cantidad positiva (reglas 5 y 6, escenario 6);
 * detalle y listado de OPs con filtros por ``status``/``bom_id``;
 * inmutabilidad de OPs ``COMPLETED``/``CANCELLED`` (regla 4, escenario 3) y
-  cancelación desde ``PLANNED``.
+  cancelación desde ``PLANNED``;
+* inicio atómico ``PLANNED → IN_PROGRESS`` con requerimientos por BOM y merma,
+  movimientos ``OUTBOUND``, déficit sin descuento parcial y rollback completo
+  ante errores de ``inventory`` (reglas 1 y 2, escenarios 1 y 2).
 
 Se usa SQLite en memoria, igual que el resto de la suite de servicios.
 """
@@ -23,14 +26,14 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine, delete, func, select
+from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -41,7 +44,14 @@ if str(BACKEND_ROOT) not in sys.path:
 os.environ.setdefault("DATABASE_URL", "sqlite://")
 
 from src.core.database import Base  # noqa: E402
-from src.modules.inventory.models import Product, Warehouse  # noqa: E402
+from src.modules.inventory import services as inventory_services  # noqa: E402
+from src.modules.inventory.models import (  # noqa: E402
+    MovementType,
+    Product,
+    Stock,
+    StockMovement,
+    Warehouse,
+)
 from src.modules.manufacturing.models import (  # noqa: E402
     BOMItem,
     BillOfMaterials,
@@ -53,6 +63,7 @@ from src.modules.manufacturing.schemas import (  # noqa: E402
     BOMCreate,
     BOMUpdate,
     ProductionOrderCreate,
+    ProductionOrderStart,
     ProductionOrderUpdate,
     WorkCenterCreate,
     WorkCenterUpdate,
@@ -62,6 +73,7 @@ from src.modules.manufacturing.services import (  # noqa: E402
     ImmutableProductionOrderError,
     InactiveBOMError,
     InactiveProductError,
+    InsufficientComponentStockError,
     InvalidBOMError,
     InvalidProductionOrderError,
     ResourceNotFoundError,
@@ -77,6 +89,7 @@ from src.modules.manufacturing.services import (  # noqa: E402
     list_boms,
     list_production_orders,
     list_work_centers,
+    start_production_order,
     update_bom,
     update_production_order,
     update_work_center,
@@ -126,6 +139,21 @@ def db_session() -> Session:
             ]
         )
         session.commit()
+        session.add_all(
+            [
+                Stock(
+                    product_id=product_id(session, "CHASIS-001"),
+                    warehouse_id=warehouse_id(session, "WHS-INSUMOS"),
+                    quantity=50,
+                ),
+                Stock(
+                    product_id=product_id(session, "MB-001"),
+                    warehouse_id=warehouse_id(session, "WHS-INSUMOS"),
+                    quantity=40,
+                ),
+            ]
+        )
+        session.commit()
         yield session
     Base.metadata.drop_all(engine)
     engine.dispose()
@@ -160,6 +188,7 @@ def bom_payload(
     version: int = 1,
     is_active: bool = True,
     component_ids: list[int] | None = None,
+    scrap_percentages: dict[str, Decimal] | None = None,
 ) -> BOMCreate:
     """BOM válida para la laptop industrial con dos componentes."""
     if component_ids is None:
@@ -167,22 +196,57 @@ def bom_payload(
             product_id(db, "CHASIS-001"),
             product_id(db, "MB-001"),
         ]
+    scraps = scrap_percentages or {}
+    sku_by_id = {
+        product_id(db, "CHASIS-001"): "CHASIS-001",
+        product_id(db, "MB-001"): "MB-001",
+    }
+    items: list[dict[str, Any]] = []
+    for pid in component_ids:
+        item: dict[str, Any] = {
+            "component_product_id": pid,
+            "quantity": Decimal("1.00"),
+        }
+        if sku_by_id.get(pid) in scraps:
+            item["scrap_percentage"] = scraps[sku_by_id[pid]]
+        items.append(item)
     return BOMCreate(
         code=code,
         product_id=product_id(db, "LAP-IND-001"),
         version=version,
         name="BOM industrial",
         is_active=is_active,
-        items=[
-            {"component_product_id": pid, "quantity": Decimal("1.00")}
-            for pid in component_ids
-        ],
+        items=items,
     )
 
 
 def warehouse_id(db: Session, code: str) -> int:
     """Devuelve el id de una bodega sembrada en la fixture."""
     return int(db.scalars(select(Warehouse.id).where(Warehouse.code == code)).one())
+
+
+def stock_quantity(db: Session, sku: str, warehouse_code: str) -> int:
+    """Devuelve el saldo de un SKU en una bodega de la fixture."""
+    value = db.scalar(
+        select(Stock.quantity).where(
+            Stock.product_id == product_id(db, sku),
+            Stock.warehouse_id == warehouse_id(db, warehouse_code),
+        )
+    )
+    return int(value or 0)
+
+
+def set_stock(db: Session, sku: str, warehouse_code: str, quantity: int) -> None:
+    """Ajusta el saldo de un componente para preparar un escenario."""
+    db.execute(
+        update(Stock)
+        .where(
+            Stock.product_id == product_id(db, sku),
+            Stock.warehouse_id == warehouse_id(db, warehouse_code),
+        )
+        .values(quantity=quantity)
+    )
+    db.commit()
 
 
 def order_payload(db: Session, **overrides: Any) -> ProductionOrderCreate:
@@ -694,3 +758,223 @@ def test_cancel_in_progress_order_requires_stock_reversal(
     assert get_production_order(db_session, order.id).status is (
         ProductionOrderStatus.IN_PROGRESS
     )
+
+
+# --------------------------------------------------------------------------- #
+# Inicio de producción (PLANNED -> IN_PROGRESS)
+# --------------------------------------------------------------------------- #
+
+
+def test_start_production_order_consumes_stock_with_scrap(
+    db_session: Session,
+) -> None:
+    bom = create_bom(
+        db_session,
+        bom_payload(db_session, scrap_percentages={"MB-001": Decimal("5.00")}),
+    )
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    started_at = date(2026, 11, 22)
+
+    started = start_production_order(
+        db_session, order.id, ProductionOrderStart(started_at=started_at)
+    )
+
+    assert started.status is ProductionOrderStatus.IN_PROGRESS
+    assert started.started_at == started_at
+    # 1 * 10 = 10; 1 * 1.05 * 10 = 10.5 -> 11 (redondeo por exceso).
+    assert stock_quantity(db_session, "CHASIS-001", "WHS-INSUMOS") == 40
+    assert stock_quantity(db_session, "MB-001", "WHS-INSUMOS") == 29
+
+    movements = db_session.scalars(
+        select(StockMovement).order_by(StockMovement.id)
+    ).all()
+    assert len(movements) == 2
+    assert all(item.movement_type is MovementType.OUTBOUND for item in movements)
+    assert all(
+        item.warehouse_source_id == order.warehouse_source_id for item in movements
+    )
+    assert all(item.warehouse_destination_id is None for item in movements)
+    assert [item.quantity for item in movements] == [10, 11]
+    assert all(item.reference_document == order.code for item in movements)
+    assert all(item.created_by == "manufacturing" for item in movements)
+    assert "MB-001" in movements[1].notes
+
+
+def test_start_production_order_defaults_started_at_to_today(
+    db_session: Session,
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+
+    started = start_production_order(db_session, order.id)
+
+    assert started.started_at == date.today()
+    assert get_production_order(db_session, order.id).status is (
+        ProductionOrderStatus.IN_PROGRESS
+    )
+
+
+def test_start_production_order_deficit_leaves_no_partial_discount(
+    db_session: Session,
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    set_stock(db_session, "CHASIS-001", "WHS-INSUMOS", 5)
+
+    with pytest.raises(InsufficientComponentStockError) as excinfo:
+        start_production_order(db_session, order.id)
+
+    error = excinfo.value
+    assert error.status_code == 400
+    assert error.sku == "CHASIS-001"
+    assert error.product_id == product_id(db_session, "CHASIS-001")
+    assert (error.available, error.required, error.deficit) == (5, 10, 5)
+    assert "CHASIS-001" in str(error)
+    assert "déficit 5" in str(error)
+    assert stock_quantity(db_session, "CHASIS-001", "WHS-INSUMOS") == 5
+    assert stock_quantity(db_session, "MB-001", "WHS-INSUMOS") == 40
+    assert count(db_session, StockMovement) == 0
+    unchanged = get_production_order(db_session, order.id)
+    assert unchanged.status is ProductionOrderStatus.PLANNED
+    assert unchanged.started_at is None
+
+
+def test_start_production_order_rolls_back_after_inventory_failure(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    set_stock(db_session, "CHASIS-001", "WHS-INSUMOS", 10)
+    set_stock(db_session, "MB-001", "WHS-INSUMOS", 10)
+
+    real_decrease = inventory_services._decrease
+    calls = {"count": 0}
+
+    def flaky_decrease(
+        stock: Stock, quantity: int, *, allow_negative_stock: bool
+    ) -> None:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise inventory_services.InsufficientStockError(
+                product_id=stock.product_id,
+                warehouse_id=stock.warehouse_id,
+                available=stock.quantity,
+                requested=quantity,
+            )
+        real_decrease(
+            stock, quantity, allow_negative_stock=allow_negative_stock
+        )
+
+    monkeypatch.setattr(inventory_services, "_decrease", flaky_decrease)
+
+    # El primer OUTBOUND llega a persistirse en la transacción antes de que el
+    # segundo falle: el rollback de inventory debe anularlo también.
+    with pytest.raises(InsufficientComponentStockError, match="MB-001"):
+        start_production_order(db_session, order.id)
+
+    assert calls["count"] == 2
+    assert stock_quantity(db_session, "CHASIS-001", "WHS-INSUMOS") == 10
+    assert stock_quantity(db_session, "MB-001", "WHS-INSUMOS") == 10
+    assert count(db_session, StockMovement) == 0
+    unchanged = get_production_order(db_session, order.id)
+    assert unchanged.status is ProductionOrderStatus.PLANNED
+    assert unchanged.started_at is None
+
+
+def test_start_production_order_translates_generic_inventory_error(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+
+    def failing_movement(db: Session, data: Any, **kwargs: Any) -> None:
+        del data, kwargs
+        db.rollback()
+        raise inventory_services.InventoryError("fallo simulado de inventario")
+
+    monkeypatch.setattr(
+        inventory_services, "create_stock_movement", failing_movement
+    )
+
+    with pytest.raises(InvalidProductionOrderError, match="fallo simulado"):
+        start_production_order(db_session, order.id)
+
+    assert stock_quantity(db_session, "CHASIS-001", "WHS-INSUMOS") == 50
+    assert stock_quantity(db_session, "MB-001", "WHS-INSUMOS") == 40
+    assert count(db_session, StockMovement) == 0
+    assert get_production_order(db_session, order.id).status is (
+        ProductionOrderStatus.PLANNED
+    )
+
+
+@pytest.mark.parametrize(
+    "status", [ProductionOrderStatus.COMPLETED, ProductionOrderStatus.CANCELLED]
+)
+def test_start_production_order_rejects_closed_orders(
+    db_session: Session, status: ProductionOrderStatus
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    order.status = status
+    db_session.commit()
+
+    with pytest.raises(ImmutableProductionOrderError, match="inmutable"):
+        start_production_order(db_session, order.id)
+
+    assert count(db_session, StockMovement) == 0
+    assert stock_quantity(db_session, "CHASIS-001", "WHS-INSUMOS") == 50
+
+
+def test_start_production_order_rejects_already_in_progress(
+    db_session: Session,
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    order.status = ProductionOrderStatus.IN_PROGRESS
+    db_session.commit()
+
+    with pytest.raises(InvalidProductionOrderError, match="PLANNED"):
+        start_production_order(db_session, order.id)
+
+    assert count(db_session, StockMovement) == 0
+    assert stock_quantity(db_session, "CHASIS-001", "WHS-INSUMOS") == 50
+
+
+def test_start_production_order_ignores_allow_negative_stock_env(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ALLOW_NEGATIVE_STOCK", "true")
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    seen: list[dict[str, Any]] = []
+    real_movement = inventory_services.create_stock_movement
+
+    def spy(db: Session, data: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return real_movement(db, data, **kwargs)
+
+    monkeypatch.setattr(inventory_services, "create_stock_movement", spy)
+
+    start_production_order(db_session, order.id, created_by="usuario-prueba")
+
+    assert len(seen) == 2
+    assert all(item["allow_negative_stock"] is False for item in seen)
+    assert all(item["commit"] is False for item in seen)
+    movements = db_session.scalars(select(StockMovement)).all()
+    assert all(item.created_by == "usuario-prueba" for item in movements)
