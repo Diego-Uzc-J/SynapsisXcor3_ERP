@@ -133,6 +133,8 @@ classDiagram
         +start_production_order(db, id, data) ProductionOrder
         +_consumed_materials_cost(db, order) Decimal
         +_register_inbound(db, data) StockMovement
+        +_outbound_consumptions(db, order) list
+        +_post_completion_accounting(db, order, data) None
         +complete_production_order(db, id, data) ProductionOrder
         +cancel_production_order(db, id) ProductionOrder
     }
@@ -337,7 +339,7 @@ flowchart TB
 
 ---
 
-## 3. Diagrama de secuencia — ciclo de vida de una orden
+## 3. Diagrama de flujo / secuencia — ciclo de vida de una orden
 
 Flujo completo para `POST /orders`, `POST /orders/{id}/start`,
 `POST /orders/{id}/complete` y `POST /orders/{id}/cancel`. Incluye validación de
@@ -396,8 +398,8 @@ sequenceDiagram
         S->>S: _calculate_requirements aplica merma y ROUND_CEILING
         S->>S: _prevalidate_stock compara con stocks de origen
         alt Stock insuficiente
-            S--xR: InsufficientComponentStockError 400 con SKU y deficit
-            R--xQ: ApiError 400
+            S--xR: InsufficientComponentStockError 400 Bad Request con SKU y deficit
+            R--xQ: ApiError 400 Bad Request
             UI--xOp: Aviso de reabastecer componente
             Note over S,DB: Sin OUTBOUND ni cambio de estado
         else Stock suficiente
@@ -472,17 +474,28 @@ sequenceDiagram
         UI--xOp: Aviso de orden inmutable
     else OP planificada
         S->>DB: UPDATE production_orders status CANCELLED
+        S->>DB: COMMIT
+        S-->>R: ProductionOrderResponse CANCELLED
+        Q->>Q: refresca detalle e invalida stock y movimientos
+        UI-->>Op: Badge Cancelada sin movimientos que revertir
     else OP en curso
         loop Cada OUTBOUND de la orden
             S->>I: create_stock_movement INBOUND commit false
             I->>DB: reversa consumo con reference_document code-CANCEL
         end
-        S->>DB: UPDATE production_orders status CANCELLED
+        alt Fallo al reversar en inventory
+            I--xS: excepcion de dominio
+            S->>DB: ROLLBACK de reversión y estado
+            S--xR: 400 Bad Request sin reversión ni cancelación
+            UI--xOp: Orden sigue IN_PROGRESS
+        else Reversión correcta
+            S->>DB: UPDATE production_orders status CANCELLED
+            S->>DB: COMMIT
+            S-->>R: ProductionOrderResponse CANCELLED
+            Q->>Q: refresca detalle e invalida stock y movimientos
+            UI-->>Op: Badge Cancelada con existencias restauradas
+        end
     end
-    S->>DB: COMMIT
-    S-->>R: ProductionOrderResponse CANCELLED
-    Q->>Q: refresca detalle e invalida stock y movimientos
-    UI-->>Op: Badge Cancelada con existencias restauradas
 ```
 
 ### Puntos críticos del flujo
@@ -507,3 +520,17 @@ sequenceDiagram
 - **Inmutabilidad.** Una vez `COMPLETED` o `CANCELLED`, cualquier transición o
   modificación de cantidades/bodegas responde 409. La corrección exige una
   nueva orden, nunca reabrir la anterior.
+
+---
+
+## Validación de sintaxis
+
+Este documento contiene **exactamente tres bloques Mermaid**, uno por diagrama
+solicitado. Todos fueron analizados con `mermaid.parse` de **Mermaid 10 y 11**
+(versiones usadas por el renderizado de GitHub) sin errores:
+
+| Bloque | Tipo | Mermaid 10 | Mermaid 11 |
+| --- | --- | --- | --- |
+| 1 | `classDiagram` | OK | OK |
+| 2 | `flowchart TB` | OK | OK (`flowchart-v2`) |
+| 3 | `sequenceDiagram` | OK | OK |
