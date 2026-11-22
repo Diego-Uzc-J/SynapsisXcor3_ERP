@@ -2,9 +2,9 @@
 
 Registra los routers de cada módulo de negocio: inventario bajo
 ``/api/v1/inventory``, ventas bajo ``/api/v1/sales``, compras bajo
-``/api/v1/purchasing``, contabilidad bajo ``/api/v1/accounting`` y
-usuarios/autenticación bajo ``/api/v1/users``, conforme a sus respectivas
-especificaciones en ``specs/``.
+``/api/v1/purchasing``, contabilidad bajo ``/api/v1/accounting``, recursos
+humanos bajo ``/api/v1/hr`` y usuarios/autenticación bajo ``/api/v1/users``,
+conforme a sus respectivas especificaciones en ``specs/``.
 
 ``slowapi`` se configura a nivel de aplicación (``app.state.limiter``) para
 aplicar los límites de ``/auth/captcha`` y ``/auth/login``.
@@ -33,6 +33,8 @@ from src.modules.inventory.router import (
     inventory_exception_handler,
     router as inventory_router,
 )
+from src.modules.hr.router import hr_exception_handler, router as hr_router
+from src.modules.hr.service import HRServiceError
 from src.modules.inventory.services import InventoryError
 from src.modules.purchasing.router import (
     purchasing_exception_handler,
@@ -99,8 +101,12 @@ app.add_exception_handler(PurchasingServiceError, purchasing_exception_handler)
 # Traduce las excepciones de dominio de contabilidad a respuestas HTTP.
 app.add_exception_handler(AccountingServiceError, accounting_exception_handler)
 
+# Traduce las excepciones de dominio de recursos humanos a respuestas HTTP.
+app.add_exception_handler(HRServiceError, hr_exception_handler)
+
 app.include_router(inventory_router, prefix="/api/v1/inventory")
 app.include_router(sales_router, prefix="/api/v1/sales")
 app.include_router(purchasing_router, prefix="/api/v1/purchasing")
 app.include_router(accounting_router, prefix="/api/v1/accounting")
+app.include_router(hr_router, prefix="/api/v1/hr")
 app.include_router(users_router, prefix="/api/v1/users")
