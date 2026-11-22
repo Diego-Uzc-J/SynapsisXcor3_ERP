@@ -118,6 +118,7 @@ __all__ = [
     "list_journal_entries",
     "list_payment_records",
     "post_journal_entry",
+    "post_production_order_accounting",
     "post_payroll_run_accounting",
     "post_purchase_receipt_accounting",
     "post_sales_credit_note_accounting",
@@ -150,6 +151,7 @@ _AUTO_CODE_LOCK_BASES: dict[str, int] = {
     "ASI-COB": 8_410_400,
     "ASI-PAG": 8_410_500,
     "ASI-NOM": 8_410_600,
+    "ASI-PRO": 8_410_700,
 }
 
 #: Mapeo por defecto de roles contables a códigos del PUC. Se usa solo cuando el
@@ -1174,6 +1176,7 @@ _LABEL_BILL = "Factura proveedor"
 _LABEL_RECEIVABLE_PAYMENT = "Cobro CxC"
 _LABEL_PAYABLE_PAYMENT = "Pago CxP"
 _LABEL_PAYROLL = "Nomina"
+_LABEL_PRODUCTION = "Orden produccion"
 
 
 def _status_value(value: Any) -> Any:
@@ -1796,6 +1799,111 @@ def post_payroll_run_accounting(
     if commit:
         db.refresh(entry)
     return AccountingResult(entry, None)
+
+
+def post_production_order_accounting(
+    db: Session,
+    *,
+    order_code: str,
+    entry_date: date,
+    total_cost: Decimal,
+    materials_cost: Decimal,
+    labor_cost: Decimal,
+    finished_goods_account_id: int | None = None,
+    materials_account_id: int | None = None,
+    labor_account_id: int | None = None,
+    created_by: str | None = None,
+    commit: bool = True,
+) -> JournalEntry:
+    """Contabiliza el cierre de una OP de manufactura (spec manufacturing §3.3).
+
+    El asiento debita el inventario de producto terminado por el coste total y
+    acredita el inventario de materias primas por el consumo y la cuenta de
+    pasivo laboral por la mano de obra del centro de trabajo. Las cuentas se
+    resuelven por id explícito o por los códigos PUC por defecto; cuando no se
+    configuran cuentas distintas, producto terminado y materias primas comparten
+    la cuenta ``inventory`` sin romper la partida doble.
+
+    Con ``commit=False`` el llamador (``manufacturing.complete_production_order``)
+    incluye el asiento en su propia unidad de trabajo. Es idempotente por el
+    código de la orden: si ya existe un asiento ``POSTED`` se devuelve sin
+    duplicarlo.
+    """
+    total = _money(total_cost)
+    materials = _money(materials_cost)
+    labor = _money(labor_cost)
+
+    if total <= 0:
+        raise InvalidJournalEntryError(
+            f"La orden '{order_code}' no tiene un coste contabilizable"
+        )
+    if materials < 0 or labor < 0:
+        raise InvalidJournalEntryError(
+            f"La orden '{order_code}' tiene costes negativos"
+        )
+    if total != _money(materials + labor):
+        raise InvalidJournalEntryError(
+            f"El coste de la orden '{order_code}' no es consistente: total "
+            f"{total} != materiales {materials} + mano de obra {labor}"
+        )
+    for label, amount in (
+        ("coste total de producción", total),
+        ("coste de materiales", materials),
+        ("coste de mano de obra", labor),
+    ):
+        _ensure_money_range(amount, label=label)
+
+    finished_id = _resolve_account_id(
+        db, "inventory", finished_goods_account_id
+    )
+    materials_id = _resolve_account_id(db, "inventory", materials_account_id)
+    labor_id = _resolve_account_id(db, "payable", labor_account_id)
+
+    zero = Decimal("0.00")
+    items = [
+        JournalItemCreate(
+            account_id=finished_id,  # type: ignore[arg-type]
+            debit=total,
+            credit=zero,
+            description=f"Producto terminado OP {order_code}",
+        ),
+        JournalItemCreate(
+            account_id=materials_id,  # type: ignore[arg-type]
+            debit=zero,
+            credit=materials,
+            description=f"Consumo de materias primas OP {order_code}",
+        ),
+    ]
+    if labor > 0:
+        items.append(
+            JournalItemCreate(
+                account_id=labor_id,  # type: ignore[arg-type]
+                debit=zero,
+                credit=labor,
+                description=f"Mano de obra OP {order_code}",
+            )
+        )
+
+    with _unit_of_work(db, commit=commit):
+        existing = _find_generated_entry(
+            db, reference=order_code, label=_LABEL_PRODUCTION
+        )
+        if existing is not None:
+            return existing
+
+        entry = _build_posted_entry(
+            db,
+            code=_next_auto_code(db, prefix="ASI-PRO", year=entry_date.year),
+            entry_date=entry_date,
+            description=f"{_LABEL_PRODUCTION} {order_code}",
+            reference_document=order_code,
+            created_by=created_by or "manufacturing-automation",
+            items=items,
+        )
+        db.add(entry)
+    if commit:
+        db.refresh(entry)
+    return entry
 
 
 # --------------------------------------------------------------------------- #

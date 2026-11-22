@@ -17,7 +17,12 @@ Cubren las reglas implementadas en ``manufacturing.services`` derivadas de
   cancelación desde ``PLANNED``;
 * inicio atómico ``PLANNED → IN_PROGRESS`` con requerimientos por BOM y merma,
   movimientos ``OUTBOUND``, déficit sin descuento parcial y rollback completo
-  ante errores de ``inventory`` (reglas 1 y 2, escenarios 1 y 2).
+  ante errores de ``inventory`` (reglas 1 y 2, escenarios 1 y 2);
+* cierre atómico con ``INBOUND``, coste de insumos y mano de obra, asiento
+  ``POSTED`` en ``accounting`` y rollback ante fallos (reglas 2 y 3,
+  escenarios 1, 3, 5 y 7);
+* cancelación desde ``PLANNED`` y desde ``IN_PROGRESS`` con reversión atómica
+  de consumos (regla 6).
 
 Se usa SQLite en memoria, igual que el resto de la suite de servicios.
 """
@@ -44,6 +49,14 @@ if str(BACKEND_ROOT) not in sys.path:
 os.environ.setdefault("DATABASE_URL", "sqlite://")
 
 from src.core.database import Base  # noqa: E402
+from src.modules.accounting import service as accounting_service  # noqa: E402
+from src.modules.accounting.models import (  # noqa: E402
+    Account,
+    AccountType,
+    JournalEntry,
+    JournalEntryStatus,
+    JournalItem,
+)
 from src.modules.inventory import services as inventory_services  # noqa: E402
 from src.modules.inventory.models import (  # noqa: E402
     MovementType,
@@ -62,6 +75,7 @@ from src.modules.manufacturing.models import (  # noqa: E402
 from src.modules.manufacturing.schemas import (  # noqa: E402
     BOMCreate,
     BOMUpdate,
+    ProductionOrderComplete,
     ProductionOrderCreate,
     ProductionOrderStart,
     ProductionOrderUpdate,
@@ -76,9 +90,11 @@ from src.modules.manufacturing.services import (  # noqa: E402
     InsufficientComponentStockError,
     InvalidBOMError,
     InvalidProductionOrderError,
+    ProductionOrderAccountingError,
     ResourceNotFoundError,
     activate_bom,
     cancel_production_order,
+    complete_production_order,
     create_bom,
     create_production_order,
     create_work_center,
@@ -136,6 +152,16 @@ def db_session() -> Session:
                 Warehouse(code="WHS-INSUMOS", name="Bodega de insumos"),
                 Warehouse(code="WHS-PT", name="Bodega de producto terminado"),
                 Warehouse(code="WHS-EXTRA", name="Bodega auxiliar"),
+                Account(
+                    code="1435",
+                    name="Inventario de productos",
+                    account_type=AccountType.ASSET,
+                ),
+                Account(
+                    code="220505",
+                    name="Cuentas por pagar",
+                    account_type=AccountType.LIABILITY,
+                ),
             ]
         )
         session.commit()
@@ -742,22 +768,33 @@ def test_cancel_production_order_from_planned(db_session: Session) -> None:
         cancel_production_order(db_session, order.id)
 
 
-def test_cancel_in_progress_order_requires_stock_reversal(
+def test_cancel_in_progress_order_reverses_consumed_stock(
     db_session: Session,
 ) -> None:
     bom = create_bom(db_session, bom_payload(db_session))
     order = create_production_order(
         db_session, order_payload(db_session, bom_id=bom.id)
     )
-    order.status = ProductionOrderStatus.IN_PROGRESS
-    db_session.commit()
+    start_production_order(db_session, order.id)
 
-    with pytest.raises(InvalidProductionOrderError, match="revertir"):
-        cancel_production_order(db_session, order.id)
+    cancelled = cancel_production_order(db_session, order.id)
 
-    assert get_production_order(db_session, order.id).status is (
-        ProductionOrderStatus.IN_PROGRESS
+    assert cancelled.status is ProductionOrderStatus.CANCELLED
+    assert stock_quantity(db_session, "CHASIS-001", "WHS-INSUMOS") == 50
+    assert stock_quantity(db_session, "MB-001", "WHS-INSUMOS") == 40
+    reversals = db_session.scalars(
+        select(StockMovement).where(
+            StockMovement.reference_document == f"{order.code}-CANCEL"
+        )
+    ).all()
+    assert [item.quantity for item in reversals] == [10, 10]
+    assert all(item.movement_type is MovementType.INBOUND for item in reversals)
+    assert all(
+        item.warehouse_destination_id == order.warehouse_source_id
+        for item in reversals
     )
+    with pytest.raises(ImmutableProductionOrderError, match="inmutable"):
+        cancel_production_order(db_session, order.id)
 
 
 # --------------------------------------------------------------------------- #
@@ -978,3 +1015,253 @@ def test_start_production_order_ignores_allow_negative_stock_env(
     assert all(item["commit"] is False for item in seen)
     movements = db_session.scalars(select(StockMovement)).all()
     assert all(item.created_by == "usuario-prueba" for item in movements)
+
+
+# --------------------------------------------------------------------------- #
+# Cierre, costeo y contabilización
+# --------------------------------------------------------------------------- #
+
+
+def test_complete_production_order_calculates_costs_and_posts_entry(
+    db_session: Session,
+) -> None:
+    work_center = create_work_center(db_session, work_center_payload())
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session,
+        order_payload(db_session, bom_id=bom.id, work_center_id=work_center.id),
+    )
+    start_production_order(db_session, order.id)
+    completed_at = date(2026, 11, 23)
+
+    completed = complete_production_order(
+        db_session,
+        order.id,
+        ProductionOrderComplete(
+            quantity_produced=Decimal("10.00"),
+            actual_hours=Decimal("2.00"),
+            completed_at=completed_at,
+        ),
+    )
+
+    assert completed.status is ProductionOrderStatus.COMPLETED
+    assert completed.quantity_produced == Decimal("10.00")
+    assert completed.actual_hours == Decimal("2.00")
+    assert completed.completed_at == completed_at
+    # 10 * (100 + 250) = 3500 de insumos; 2 h * 150 = 300 de mano de obra.
+    assert completed.total_production_cost == Decimal("3800.00")
+    assert completed.unit_production_cost == Decimal("380.00")
+    assert stock_quantity(db_session, "LAP-IND-001", "WHS-PT") == 10
+
+    inbound = db_session.scalars(
+        select(StockMovement).where(
+            StockMovement.movement_type == MovementType.INBOUND
+        )
+    ).all()
+    assert len(inbound) == 1
+    assert inbound[0].product_id == bom.product_id
+    assert inbound[0].quantity == 10
+    assert inbound[0].warehouse_destination_id == order.warehouse_destination_id
+    assert inbound[0].reference_document == order.code
+
+    entries = db_session.scalars(select(JournalEntry)).all()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.code.startswith("ASI-PRO-")
+    assert entry.status is JournalEntryStatus.POSTED
+    assert entry.reference_document == order.code
+    assert entry.entry_date == completed_at
+    lines = db_session.scalars(
+        select(JournalItem).where(JournalItem.journal_entry_id == entry.id)
+    ).all()
+    assert len(lines) == 3
+    total_debit = sum((line.debit for line in lines), Decimal("0.00"))
+    total_credit = sum((line.credit for line in lines), Decimal("0.00"))
+    assert total_debit == total_credit == Decimal("3800.00")
+
+
+def test_complete_production_order_without_work_center(
+    db_session: Session,
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    start_production_order(db_session, order.id)
+
+    completed = complete_production_order(
+        db_session,
+        order.id,
+        ProductionOrderComplete(
+            quantity_produced=Decimal("10.00"), actual_hours=Decimal("5.00")
+        ),
+    )
+
+    assert completed.total_production_cost == Decimal("3500.00")
+    assert completed.unit_production_cost == Decimal("350.00")
+    assert completed.work_center_id is None
+    entry = db_session.scalars(select(JournalEntry)).one()
+    lines = db_session.scalars(
+        select(JournalItem).where(JournalItem.journal_entry_id == entry.id)
+    ).all()
+    assert len(lines) == 2  # sin mano de obra no hay tercera línea
+    assert sum((line.credit for line in lines), Decimal("0.00")) == Decimal(
+        "3500.00"
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "message"),
+    [
+        (ProductionOrderStatus.PLANNED, InvalidProductionOrderError, "IN_PROGRESS"),
+        (
+            ProductionOrderStatus.COMPLETED,
+            ImmutableProductionOrderError,
+            "inmutable",
+        ),
+        (
+            ProductionOrderStatus.CANCELLED,
+            ImmutableProductionOrderError,
+            "inmutable",
+        ),
+    ],
+)
+def test_complete_production_order_rejects_invalid_states(
+    db_session: Session,
+    status: ProductionOrderStatus,
+    error: type[Exception],
+    message: str,
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    order.status = status
+    db_session.commit()
+
+    with pytest.raises(error, match=message):
+        complete_production_order(
+            db_session,
+            order.id,
+            ProductionOrderComplete(quantity_produced=Decimal("1.00")),
+        )
+
+    assert count(db_session, JournalEntry) == 0
+    assert stock_quantity(db_session, "LAP-IND-001", "WHS-PT") == 0
+
+
+def test_complete_production_order_rejects_non_positive_quantity(
+    db_session: Session,
+) -> None:
+    with pytest.raises(ValidationError):
+        ProductionOrderComplete(quantity_produced=Decimal("0.00"))
+    with pytest.raises(ValidationError):
+        ProductionOrderComplete(
+            quantity_produced=Decimal("1.00"), actual_hours=Decimal("-1.00")
+        )
+
+
+def test_complete_production_order_inventory_failure_rolls_back(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    start_production_order(db_session, order.id)
+
+    def failing_increase(stock: Stock, quantity: int) -> None:
+        del stock, quantity
+        raise inventory_services.InventoryError("fallo simulado de inventario")
+
+    monkeypatch.setattr(inventory_services, "_increase", failing_increase)
+
+    with pytest.raises(InvalidProductionOrderError, match="fallo simulado"):
+        complete_production_order(
+            db_session,
+            order.id,
+            ProductionOrderComplete(quantity_produced=Decimal("10.00")),
+        )
+
+    unchanged = get_production_order(db_session, order.id)
+    assert unchanged.status is ProductionOrderStatus.IN_PROGRESS
+    assert unchanged.completed_at is None
+    assert unchanged.total_production_cost is None
+    assert unchanged.unit_production_cost is None
+    assert stock_quantity(db_session, "LAP-IND-001", "WHS-PT") == 0
+    assert count(db_session, StockMovement) == 2  # solo los OUTBOUND del start
+    assert count(db_session, JournalEntry) == 0
+
+
+def test_complete_production_order_accounting_failure_rolls_back(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    start_production_order(db_session, order.id)
+
+    def failing_post(db: Session, **kwargs: Any) -> None:
+        # Se registra un asiento antes de fallar para comprobar que el rollback
+        # también lo revierte, no solo el cambio de estado.
+        db.add(
+            JournalEntry(
+                code="ASI-PRO-9999",
+                entry_date=date(2026, 11, 23),
+                description="Asiento parcial",
+                status=JournalEntryStatus.POSTED,
+                created_by="prueba",
+            )
+        )
+        db.flush()
+        raise RuntimeError(f"fallo simulado de contabilidad: {kwargs['order_code']}")
+
+    monkeypatch.setattr(
+        accounting_service, "post_production_order_accounting", failing_post
+    )
+
+    with pytest.raises(ProductionOrderAccountingError, match="fallo simulado"):
+        complete_production_order(
+            db_session,
+            order.id,
+            ProductionOrderComplete(quantity_produced=Decimal("10.00")),
+        )
+
+    unchanged = get_production_order(db_session, order.id)
+    assert unchanged.status is ProductionOrderStatus.IN_PROGRESS
+    assert unchanged.total_production_cost is None
+    assert unchanged.unit_production_cost is None
+    assert stock_quantity(db_session, "LAP-IND-001", "WHS-PT") == 0
+    assert count(db_session, StockMovement) == 2
+    assert count(db_session, JournalEntry) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Cancelación con reversión de insumos
+# --------------------------------------------------------------------------- #
+
+
+def test_cancel_production_order_inventory_failure_rolls_back(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bom = create_bom(db_session, bom_payload(db_session))
+    order = create_production_order(
+        db_session, order_payload(db_session, bom_id=bom.id)
+    )
+    start_production_order(db_session, order.id)
+
+    def failing_increase(stock: Stock, quantity: int) -> None:
+        del stock, quantity
+        raise inventory_services.InventoryError("fallo simulado de inventario")
+
+    monkeypatch.setattr(inventory_services, "_increase", failing_increase)
+
+    with pytest.raises(InvalidProductionOrderError, match="fallo simulado"):
+        cancel_production_order(db_session, order.id)
+
+    unchanged = get_production_order(db_session, order.id)
+    assert unchanged.status is ProductionOrderStatus.IN_PROGRESS
+    assert stock_quantity(db_session, "CHASIS-001", "WHS-INSUMOS") == 40
+    assert stock_quantity(db_session, "MB-001", "WHS-INSUMOS") == 30
+    assert count(db_session, StockMovement) == 2

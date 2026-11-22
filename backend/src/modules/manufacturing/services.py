@@ -22,6 +22,13 @@ inicial de órdenes de producción descrita en ``specs/manufacturing_spec.md``
   BOM con su merma y registra los ``OUTBOUND`` en ``inventory`` bajo el mismo
   ``COMMIT`` que el cambio de estado (reglas 1 y 2, escenarios 1 y 2). Un
   déficit de stock revierte todo el trabajo, sin descuentos parciales.
+* **Cierre y costeo:** ``IN_PROGRESS → COMPLETED`` registra el ``INBOUND`` del
+  producto terminado, calcula materiales consumidos más mano de obra, publica
+  el asiento en ``accounting`` y fija costes y ``completed_at`` en una sola
+  transacción (reglas 2 y 3, escenarios 1, 3 y 5).
+* **Cancelación:** desde ``PLANNED`` sin movimientos; desde ``IN_PROGRESS``
+  devuelve los insumos con ``INBOUND`` en la bodega de origen y cancela en la
+  misma transacción (regla 6).
 
 Las validaciones que no requieren consultar estado ya viven en ``schemas.py``;
 aquí se comprueban las reglas que dependen de la base de datos. Las escrituras
@@ -41,7 +48,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, NamedTuple, TypeVar
 
 from fastapi import HTTPException
@@ -49,8 +56,15 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from src.modules.accounting import service as accounting_service
 from src.modules.inventory import services as inventory_services
-from src.modules.inventory.models import MovementType, Product, Stock, Warehouse
+from src.modules.inventory.models import (
+    MovementType,
+    Product,
+    Stock,
+    StockMovement,
+    Warehouse,
+)
 from src.modules.inventory.schemas import StockMovementCreate
 from src.modules.manufacturing.models import (
     BOMItem,
@@ -63,6 +77,7 @@ from src.modules.manufacturing.schemas import (
     BOMCreate,
     BOMItemCreate,
     BOMUpdate,
+    ProductionOrderComplete,
     ProductionOrderCreate,
     ProductionOrderStart,
     ProductionOrderUpdate,
@@ -79,9 +94,11 @@ __all__ = [
     "InvalidBOMError",
     "InvalidProductionOrderError",
     "ManufacturingServiceError",
+    "ProductionOrderAccountingError",
     "ResourceNotFoundError",
     "activate_bom",
     "cancel_production_order",
+    "complete_production_order",
     "create_bom",
     "create_production_order",
     "create_work_center",
@@ -202,6 +219,12 @@ class InsufficientComponentStockError(ManufacturingServiceError):
         if order_code is not None:
             detail += f" para la orden '{order_code}'"
         super().__init__(detail)
+
+
+class ProductionOrderAccountingError(ManufacturingServiceError):
+    """Falló la contabilización al cerrar una OP; la transacción se revirtió."""
+
+    status_code = 400
 
 
 # --------------------------------------------------------------------------- #
@@ -857,6 +880,139 @@ def _register_outbound(
         ) from exc
 
 
+def _to_stock_quantity(value: Decimal, *, field: str) -> int:
+    """Convierte una cantidad decimal a entera sin quedarse corto."""
+    quantity = _ensure_positive_quantity(value, field=field)
+    return max(int(quantity.to_integral_value(rounding=ROUND_CEILING)), 1)
+
+
+def _outbound_consumptions(db: Session, order: ProductionOrder) -> list[StockMovement]:
+    """Movimientos de salida registrados por el inicio de una OP."""
+    return list(
+        db.scalars(
+            select(StockMovement)
+            .where(
+                StockMovement.reference_document == order.code,
+                StockMovement.movement_type == MovementType.OUTBOUND,
+                StockMovement.warehouse_source_id == order.warehouse_source_id,
+            )
+            .order_by(StockMovement.id)
+        ).all()
+    )
+
+
+def _consumed_materials_cost(db: Session, order: ProductionOrder) -> Decimal:
+    """Coste real de los insumos descontados por la OP (regla 3).
+
+    Se calcula a partir de los movimientos ``OUTBOUND`` ya registrados, no de
+    la BOM teórica, para que el asiento refleje exactamente lo consumido.
+    """
+    movements = _outbound_consumptions(db, order)
+    if not movements:
+        return Decimal("0.00")
+    product_ids = {movement.product_id for movement in movements}
+    prices = dict(
+        db.execute(
+            select(Product.id, Product.unit_price).where(Product.id.in_(product_ids))
+        ).all()
+    )
+    total = Decimal("0.00")
+    for movement in movements:
+        price = prices.get(movement.product_id)
+        if price is None:
+            raise ResourceNotFoundError(
+                f"Producto {movement.product_id} del consumo de la orden "
+                f"'{order.code}' no encontrado en inventario"
+            )
+        total += Decimal(movement.quantity) * Decimal(price)
+    return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _finished_product_id(db: Session, order: ProductionOrder) -> int:
+    """Devuelve el producto terminado de la BOM referenciada por la OP."""
+    product_id = db.scalar(
+        select(BillOfMaterials.product_id).where(
+            BillOfMaterials.id == order.bom_id
+        )
+    )
+    if product_id is None:
+        raise ResourceNotFoundError(
+            f"BOM {order.bom_id} de la orden '{order.code}' no encontrada"
+        )
+    return int(product_id)
+
+
+def _register_inbound(
+    db: Session,
+    *,
+    product_id: int,
+    quantity: int,
+    warehouse_id: int,
+    order_code: str,
+    created_by: str,
+    notes: str | None = None,
+    reference_document: str | None = None,
+) -> None:
+    """Registra una entrada en ``inventory`` dentro de la transacción de la OP."""
+    payload = StockMovementCreate(
+        product_id=product_id,
+        movement_type=MovementType.INBOUND,
+        warehouse_destination_id=warehouse_id,
+        quantity=quantity,
+        reference_document=reference_document or order_code,
+        notes=notes or f"Producto terminado de la orden {order_code}",
+        created_by=created_by,
+    )
+    try:
+        inventory_services.create_stock_movement(
+            db,
+            payload,
+            allow_negative_stock=False,
+            commit=False,
+        )
+    except inventory_services.ResourceNotFoundError as exc:
+        raise ResourceNotFoundError(str(exc)) from exc
+    except inventory_services.InventoryError as exc:
+        raise InvalidProductionOrderError(
+            f"No se pudo registrar la entrada en inventario de la orden "
+            f"'{order_code}': {exc}"
+        ) from exc
+
+
+def _post_completion_accounting(
+    db: Session,
+    *,
+    order: ProductionOrder,
+    entry_date: date,
+    total_cost: Decimal,
+    materials_cost: Decimal,
+    labor_cost: Decimal,
+    created_by: str,
+    finished_goods_account_id: int | None,
+    materials_account_id: int | None,
+    labor_account_id: int | None,
+) -> None:
+    """Publica el asiento de cierre en ``accounting`` sin hacer commit."""
+    try:
+        accounting_service.post_production_order_accounting(
+            db,
+            order_code=order.code,
+            entry_date=entry_date,
+            total_cost=total_cost,
+            materials_cost=materials_cost,
+            labor_cost=labor_cost,
+            finished_goods_account_id=finished_goods_account_id,
+            materials_account_id=materials_account_id,
+            labor_account_id=labor_account_id,
+            created_by=created_by,
+            commit=False,
+        )
+    except Exception as exc:
+        raise ProductionOrderAccountingError(
+            f"No se pudo contabilizar la orden '{order.code}': {exc}"
+        ) from exc
+
+
 def _ensure_unique_order_code(
     db: Session, code: str, *, exclude_id: int | None = None
 ) -> None:
@@ -1149,6 +1305,86 @@ def start_production_order(
     return order
 
 
+def complete_production_order(
+    db: Session,
+    order_id: int,
+    data: ProductionOrderComplete,
+    *,
+    created_by: str = "manufacturing",
+    finished_goods_account_id: int | None = None,
+    materials_account_id: int | None = None,
+    labor_account_id: int | None = None,
+) -> ProductionOrder:
+    """Cierra una OP ``IN_PROGRESS`` con inventario y contabilidad en un ACID.
+
+    Registra el ``INBOUND`` del producto terminado, calcula el coste de los
+    insumos realmente consumidos más la mano de obra del centro de trabajo,
+    publica el asiento contable y fija ``COMPLETED`` con ``completed_at`` en una
+    sola transacción (reglas 2 y 3, escenarios 1, 3, 5 y 7). Si fallan
+    ``inventory`` o ``accounting`` no queda entrada parcial, asiento ni cambio
+    de estado: la orden sigue ``IN_PROGRESS``.
+    """
+    quantity = _ensure_positive_quantity(
+        data.quantity_produced, field="quantity_produced"
+    )
+    actual_hours = _ensure_non_negative_hours(
+        data.actual_hours, field="actual_hours"
+    )
+    completed_at = data.completed_at or date.today()
+
+    with _atomic(db):
+        order = ensure_production_order_mutable(db, order_id)
+        if order.status is not ProductionOrderStatus.IN_PROGRESS:
+            raise InvalidProductionOrderError(
+                f"La orden '{order.code}' debe estar IN_PROGRESS para "
+                f"completarse; estado actual: {order.status.value}"
+            )
+
+        materials_cost = _consumed_materials_cost(db, order)
+        labor_cost = Decimal("0.00")
+        if order.work_center_id is not None:
+            work_center = get_work_center(db, order.work_center_id)
+            labor_cost = (
+                actual_hours * Decimal(work_center.cost_per_hour)
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total_cost = (materials_cost + labor_cost).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        unit_cost = (total_cost / quantity).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+
+        _register_inbound(
+            db,
+            product_id=_finished_product_id(db, order),
+            quantity=_to_stock_quantity(quantity, field="quantity_produced"),
+            warehouse_id=order.warehouse_destination_id,
+            order_code=order.code,
+            created_by=created_by,
+        )
+        _post_completion_accounting(
+            db,
+            order=order,
+            entry_date=completed_at,
+            total_cost=total_cost,
+            materials_cost=materials_cost,
+            labor_cost=labor_cost,
+            created_by=created_by,
+            finished_goods_account_id=finished_goods_account_id,
+            materials_account_id=materials_account_id,
+            labor_account_id=labor_account_id,
+        )
+
+        order.status = ProductionOrderStatus.COMPLETED
+        order.quantity_produced = quantity
+        order.actual_hours = actual_hours
+        order.completed_at = completed_at
+        order.total_production_cost = total_cost
+        order.unit_production_cost = unit_cost
+    db.refresh(order)
+    return order
+
+
 def ensure_production_order_mutable(
     db: Session, order_id: int
 ) -> ProductionOrder:
@@ -1162,19 +1398,39 @@ def ensure_production_order_mutable(
     return order
 
 
-def cancel_production_order(db: Session, order_id: int) -> ProductionOrder:
-    """Cancela una OP ``PLANNED``; las cerradas se rechazan por inmutables.
+def cancel_production_order(
+    db: Session, order_id: int, *, created_by: str = "manufacturing"
+) -> ProductionOrder:
+    """Cancela una OP y revierte sus consumos si ya estaba ``IN_PROGRESS``.
 
-    Cancelar desde ``IN_PROGRESS`` exigiría revertir los insumos ya descontados
-    por :func:`start_production_order` (regla 6); esa reversión no está
-    implementada, por lo que la transición se rechaza con 400.
+    Una OP ``PLANNED`` se cancela sin movimientos. Si está ``IN_PROGRESS``, se
+    registran entradas ``INBOUND`` en la bodega de origen por cada ``OUTBOUND``
+    de :func:`start_production_order`, con el mismo ``COMMIT`` que el cambio a
+    ``CANCELLED`` (regla 6, escenario 3). Las OPs ``COMPLETED``/``CANCELLED`` se
+    rechazan por inmutables (409). Un error de ``inventory`` revierte tanto la
+    reversión como el estado.
     """
     with _atomic(db):
         order = ensure_production_order_mutable(db, order_id)
-        if order.status is not ProductionOrderStatus.PLANNED:
+        if order.status is ProductionOrderStatus.IN_PROGRESS:
+            for movement in _outbound_consumptions(db, order):
+                source_id = movement.warehouse_source_id
+                if source_id is None:  # los OUTBOUND siempre tienen origen
+                    continue
+                _register_inbound(
+                    db,
+                    product_id=movement.product_id,
+                    quantity=movement.quantity,
+                    warehouse_id=source_id,
+                    order_code=order.code,
+                    created_by=created_by,
+                    reference_document=f"{order.code}-CANCEL",
+                    notes=f"Reversión del consumo de la orden {order.code}",
+                )
+        elif order.status is not ProductionOrderStatus.PLANNED:
             raise InvalidProductionOrderError(
                 f"No se puede cancelar la orden '{order.code}' desde "
-                f"{order.status.value} sin revertir los insumos consumidos"
+                f"{order.status.value}"
             )
         order.status = ProductionOrderStatus.CANCELLED
     db.refresh(order)
