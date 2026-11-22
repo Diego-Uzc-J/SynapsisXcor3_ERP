@@ -57,7 +57,7 @@ export const MODULES: readonly ModuleDefinition[] = [
     label: "Recursos humanos",
     description: "Personal y nómina",
     path: "/hr",
-    implemented: false,
+    implemented: true,
   },
   {
     key: "manufacturing",
@@ -154,6 +154,29 @@ export const ACCOUNTING_LINKS = [
     to: "/accounting/reports",
     label: "Reportes",
     description: "Estados financieros",
+  },
+] as const;
+
+export const HR_LINKS = [
+  {
+    to: "/hr/employees",
+    label: "Empleados",
+    description: "Expedientes e historial laboral",
+  },
+  {
+    to: "/hr/contracts",
+    label: "Contratos",
+    description: "Vigencia e historial por empleado",
+  },
+  {
+    to: "/hr/attendance",
+    label: "Asistencia",
+    description: "Novedades y horas extra",
+  },
+  {
+    to: "/hr/payrolls",
+    label: "Nómina",
+    description: "Periodos, desprendibles y aprobación",
   },
 ] as const;
 

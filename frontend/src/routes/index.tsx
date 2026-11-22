@@ -9,6 +9,12 @@ import InventoryPage from "../modules/inventory/InventoryPage";
 import ProductList from "../modules/inventory/ProductList";
 import WarehouseList from "../modules/inventory/WarehouseList";
 import GoodsReceiptList from "../modules/purchasing/GoodsReceiptList";
+import AttendancePage from "../modules/hr/AttendancePage";
+import ContractsPage from "../modules/hr/ContractsPage";
+import EmployeeList from "../modules/hr/EmployeeList";
+import EmployeeProfile from "../modules/hr/EmployeeProfile";
+import PayrollRunDetail from "../modules/hr/PayrollRunDetail";
+import PayrollRunsPage from "../modules/hr/PayrollRunsPage";
 import PurchaseOrderList from "../modules/purchasing/PurchaseOrderList";
 import SupplierBillDetail from "../modules/purchasing/SupplierBillDetail";
 import SupplierBillList from "../modules/purchasing/SupplierBillList";
@@ -155,8 +161,30 @@ export const router = createBrowserRouter([
             element: <RequireModule module="hr" />,
             children: [
               {
-                path: "hr",
-                element: <ModulePlaceholder module="hr" />,
+                element: (
+                  <RequireRole
+                    roles={["hr", "administrator"]}
+                    module="hr"
+                  />
+                ),
+                children: [
+                  {
+                    path: "hr",
+                    element: <Navigate to="/hr/employees" replace />,
+                  },
+                  { path: "hr/employees", element: <EmployeeList /> },
+                  {
+                    path: "hr/employees/:employeeId",
+                    element: <EmployeeProfile />,
+                  },
+                  { path: "hr/contracts", element: <ContractsPage /> },
+                  { path: "hr/attendance", element: <AttendancePage /> },
+                  { path: "hr/payrolls", element: <PayrollRunsPage /> },
+                  {
+                    path: "hr/payrolls/:payrollRunId",
+                    element: <PayrollRunDetail />,
+                  },
+                ],
               },
             ],
           },

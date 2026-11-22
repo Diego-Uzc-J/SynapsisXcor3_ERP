@@ -4,6 +4,7 @@ import { initials, ROLE_LABELS } from "../modules/users/constants";
 import {
   accessibleModules,
   ACCOUNTING_LINKS,
+  HR_LINKS,
   INVENTORY_LINKS,
   PURCHASING_LINKS,
   SALES_LINKS,
@@ -43,6 +44,7 @@ export default function AppLayout() {
   const sales = modules.find((module) => module.key === "sales");
   const purchasing = modules.find((module) => module.key === "purchasing");
   const accounting = modules.find((module) => module.key === "accounting");
+  const hr = modules.find((module) => module.key === "hr");
   const users = modules.find((module) => module.key === "users");
   const otherModules = modules.filter(
     (module) =>
@@ -50,6 +52,7 @@ export default function AppLayout() {
       module.key !== "sales" &&
       module.key !== "purchasing" &&
       module.key !== "accounting" &&
+      module.key !== "hr" &&
       module.key !== "users",
   );
   const isInventoryReadOnly =
@@ -70,6 +73,12 @@ export default function AppLayout() {
     accounting !== undefined &&
     user !== null &&
     (user.role.name === "administrator" || user.role.name === "accounting");
+  // Igual que ventas, compras y contabilidad, las rutas de RRHH exigen además
+  // el rol `hr` (o administrador); el backend aplica la misma regla.
+  const canOpenHr =
+    hr !== undefined &&
+    user !== null &&
+    (user.role.name === "administrator" || user.role.name === "hr");
 
   const mobileLinks = [
     ...(inventory === undefined
@@ -83,6 +92,9 @@ export default function AppLayout() {
       : []),
     ...(canOpenAccounting
       ? ACCOUNTING_LINKS.map((link) => ({ to: link.to, label: link.label }))
+      : []),
+    ...(canOpenHr
+      ? HR_LINKS.map((link) => ({ to: link.to, label: link.label }))
       : []),
     ...otherModules.map((module) => ({
       to: module.path,
@@ -188,6 +200,27 @@ export default function AppLayout() {
               <>
                 <SectionLabel>{accounting.label}</SectionLabel>
                 {ACCOUNTING_LINKS.map((item) => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end
+                    className={({ isActive }) => navItemClass(isActive)}
+                  >
+                    <span className="block text-sm font-semibold lg:text-[0.8125rem]">
+                      {item.label}
+                    </span>
+                    <span className="hidden text-xs text-concrete-400 lg:block">
+                      {item.description}
+                    </span>
+                  </NavLink>
+                ))}
+              </>
+            ) : null}
+
+            {canOpenHr && hr !== undefined ? (
+              <>
+                <SectionLabel>{hr.label}</SectionLabel>
+                {HR_LINKS.map((item) => (
                   <NavLink
                     key={item.to}
                     to={item.to}
