@@ -17,6 +17,7 @@ from src.core.database import Base, DATABASE_URL
 from src.modules.accounting import models as accounting_models  # noqa: F401
 from src.modules.hr import models as hr_models  # noqa: F401
 from src.modules.inventory import models as inventory_models  # noqa: F401
+from src.modules.manufacturing import models as manufacturing_models  # noqa: F401
 from src.modules.purchasing import models as purchasing_models  # noqa: F401
 from src.modules.sales import models as sales_models  # noqa: F401
 from src.modules.users import models as users_models  # noqa: F401
