@@ -8,6 +8,11 @@ import ReceivablesPayablesPage from "../modules/accounting/ReceivablesPayablesPa
 import InventoryPage from "../modules/inventory/InventoryPage";
 import ProductList from "../modules/inventory/ProductList";
 import WarehouseList from "../modules/inventory/WarehouseList";
+import BomDetail from "../modules/manufacturing/BomDetail";
+import BomList from "../modules/manufacturing/BomList";
+import ProductionOrderDetail from "../modules/manufacturing/ProductionOrderDetail";
+import ProductionOrderList from "../modules/manufacturing/ProductionOrderList";
+import WorkCenterList from "../modules/manufacturing/WorkCenterList";
 import GoodsReceiptList from "../modules/purchasing/GoodsReceiptList";
 import AttendancePage from "../modules/hr/AttendancePage";
 import ContractsPage from "../modules/hr/ContractsPage";
@@ -27,7 +32,6 @@ import LoginPage from "../modules/users/LoginPage";
 import UserList from "../modules/users/UserList";
 import AccessDenied from "./AccessDenied";
 import { IndexRedirect, RequireAuth, RequireModule, RequireRole } from "./guards";
-import ModulePlaceholder from "./ModulePlaceholder";
 
 export const router = createBrowserRouter([
   {
@@ -192,8 +196,35 @@ export const router = createBrowserRouter([
             element: <RequireModule module="manufacturing" />,
             children: [
               {
-                path: "manufacturing",
-                element: <ModulePlaceholder module="manufacturing" />,
+                element: (
+                  <RequireRole
+                    roles={["manufacturing", "administrator"]}
+                    module="manufacturing"
+                  />
+                ),
+                children: [
+                  {
+                    path: "manufacturing",
+                    element: <Navigate to="/manufacturing/orders" replace />,
+                  },
+                  {
+                    path: "manufacturing/work-centers",
+                    element: <WorkCenterList />,
+                  },
+                  { path: "manufacturing/boms", element: <BomList /> },
+                  {
+                    path: "manufacturing/boms/:bomId",
+                    element: <BomDetail />,
+                  },
+                  {
+                    path: "manufacturing/orders",
+                    element: <ProductionOrderList />,
+                  },
+                  {
+                    path: "manufacturing/orders/:orderId",
+                    element: <ProductionOrderDetail />,
+                  },
+                ],
               },
             ],
           },

@@ -6,6 +6,7 @@ import {
   ACCOUNTING_LINKS,
   HR_LINKS,
   INVENTORY_LINKS,
+  MANUFACTURING_LINKS,
   PURCHASING_LINKS,
   SALES_LINKS,
 } from "../routes/modules";
@@ -45,6 +46,7 @@ export default function AppLayout() {
   const purchasing = modules.find((module) => module.key === "purchasing");
   const accounting = modules.find((module) => module.key === "accounting");
   const hr = modules.find((module) => module.key === "hr");
+  const manufacturing = modules.find((module) => module.key === "manufacturing");
   const users = modules.find((module) => module.key === "users");
   const otherModules = modules.filter(
     (module) =>
@@ -53,6 +55,7 @@ export default function AppLayout() {
       module.key !== "purchasing" &&
       module.key !== "accounting" &&
       module.key !== "hr" &&
+      module.key !== "manufacturing" &&
       module.key !== "users",
   );
   const isInventoryReadOnly =
@@ -79,6 +82,12 @@ export default function AppLayout() {
     hr !== undefined &&
     user !== null &&
     (user.role.name === "administrator" || user.role.name === "hr");
+  // Las rutas de manufactura exigen además el rol `manufacturing` (o admin),
+  // igual que el guardia RequireRole y el router FastAPI.
+  const canOpenManufacturing =
+    manufacturing !== undefined &&
+    user !== null &&
+    (user.role.name === "administrator" || user.role.name === "manufacturing");
 
   const mobileLinks = [
     ...(inventory === undefined
@@ -95,6 +104,9 @@ export default function AppLayout() {
       : []),
     ...(canOpenHr
       ? HR_LINKS.map((link) => ({ to: link.to, label: link.label }))
+      : []),
+    ...(canOpenManufacturing
+      ? MANUFACTURING_LINKS.map((link) => ({ to: link.to, label: link.label }))
       : []),
     ...otherModules.map((module) => ({
       to: module.path,
@@ -221,6 +233,27 @@ export default function AppLayout() {
               <>
                 <SectionLabel>{hr.label}</SectionLabel>
                 {HR_LINKS.map((item) => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end
+                    className={({ isActive }) => navItemClass(isActive)}
+                  >
+                    <span className="block text-sm font-semibold lg:text-[0.8125rem]">
+                      {item.label}
+                    </span>
+                    <span className="hidden text-xs text-concrete-400 lg:block">
+                      {item.description}
+                    </span>
+                  </NavLink>
+                ))}
+              </>
+            ) : null}
+
+            {canOpenManufacturing && manufacturing !== undefined ? (
+              <>
+                <SectionLabel>{manufacturing.label}</SectionLabel>
+                {MANUFACTURING_LINKS.map((item) => (
                   <NavLink
                     key={item.to}
                     to={item.to}

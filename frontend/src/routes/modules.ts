@@ -62,9 +62,9 @@ export const MODULES: readonly ModuleDefinition[] = [
   {
     key: "manufacturing",
     label: "Manufactura",
-    description: "Órdenes y materias primas",
+    description: "Órdenes, BOM y centros de trabajo",
     path: "/manufacturing",
-    implemented: false,
+    implemented: true,
   },
   {
     key: "users",
@@ -177,6 +177,24 @@ export const HR_LINKS = [
     to: "/hr/payrolls",
     label: "Nómina",
     description: "Periodos, desprendibles y aprobación",
+  },
+] as const;
+
+export const MANUFACTURING_LINKS = [
+  {
+    to: "/manufacturing/orders",
+    label: "Órdenes",
+    description: "Planificación, ejecución y costes",
+  },
+  {
+    to: "/manufacturing/boms",
+    label: "Listas de materiales",
+    description: "Recetas, versiones y componentes",
+  },
+  {
+    to: "/manufacturing/work-centers",
+    label: "Centros de trabajo",
+    description: "Estaciones y coste por hora",
   },
 ] as const;
 
